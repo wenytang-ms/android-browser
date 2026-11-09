@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Tango Android Share",
+  "version": "0.0.1",
+  "description": "USB Android mirroring and authenticated remote viewing.",
+  "minimum_chrome_version": "118",
+  "permissions": ["storage"],
+  "action": {
+    "default_title": "Open Android device session"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https: wss: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*"
+  },
+  "version_name": "0.0.1-alpha"
+}

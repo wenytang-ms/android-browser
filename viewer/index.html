@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Tango Android Share · 远端观看</title>
+  </head>
+  <body>
+    <main>
+      <h1>Android 远程观看</h1>
+      <p>画面来自宿主电脑的 USB 手机；此页面不访问 USB，也不提供设备控制。</p>
+      <section class="panel">
+        <button id="join" class="primary">授权并观看</button>
+        <button id="leave" disabled>结束观看</button>
+        <p id="status" class="status" role="status">等待授权。</p>
+        <p id="expiry" class="hint"></p>
+      </section>
+      <div class="panel screen">
+        <canvas
+          id="screen"
+          width="720"
+          height="1280"
+          aria-label="远程 Android 实时画面"
+        ></canvas>
+      </div>
+      <p id="stats" class="stats">等待视频</p>
+      <p class="hint">
+        需要支持 H.264 WebCodecs
+        的浏览器。若分享已撤销或过期，请使用宿主提供的新链接。不要转发含凭据的分享链接。
+      </p>
+    </main>
+    <script type="module" src="../src/viewer/main.ts"></script>
+  </body>
+</html>

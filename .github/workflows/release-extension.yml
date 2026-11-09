@@ -1,0 +1,115 @@
+name: Release Chrome extension
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 0.0.1-alpha (without v)"
+        required: true
+        default: "0.0.1-alpha"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: chrome-extension-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Check source formatting
+        run: npm run format:check
+
+      - name: Set release and Chrome versions
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
+        run: node scripts/release-version.mjs "$REQUESTED_VERSION"
+
+      - name: Run regression tests
+        run: npm test
+
+      - name: Build the bundled extension
+        run: npm run build
+
+      - name: Package extension
+        working-directory: dist/extension
+        env:
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+        run: |
+          zip -q -r "../$ARCHIVE" .
+          cd ..
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          unzip -t "$ARCHIVE"
+
+      - name: Preserve packaged artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: chrome-extension-${{ steps.version.outputs.version }}
+          path: |
+            dist/${{ steps.version.outputs.archive }}
+            dist/${{ steps.version.outputs.archive }}.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_tags="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
+          if [ -n "$remote_tags" ]; then
+            tag_commit="$(printf '%s\n' "$remote_tags" | tail -n 1 | cut -f 1)"
+            if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+              echo "::error::Release tag already points to another commit; refusing to replace it."
+              exit 1
+            fi
+          fi
+          cat > dist/release-notes.md <<'NOTES'
+          ## Chrome extension
+
+          Download the `tango-android-share-*.zip` asset and extract it.
+          In desktop Chrome 118+, open `chrome://extensions`, enable Developer mode,
+          choose **Load unpacked**, and select the extracted folder containing `manifest.json`.
+
+          This package includes Tango, the WebCodecs player, scrcpy-server 2.1 and third-party notices.
+          Remote sharing requires the project developer's HTTPS/WSS relay.
+          See the repository README for setup, USB driver compatibility and deployment instructions.
+
+          Real Android-device and cross-network acceptance testing is still pending.
+          NOTES
+          args=(
+            release create "$RELEASE_TAG"
+            "dist/$ARCHIVE"
+            "dist/$ARCHIVE.sha256"
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "$RELEASE_VERSION"
+            --notes-file dist/release-notes.md
+          )
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}"

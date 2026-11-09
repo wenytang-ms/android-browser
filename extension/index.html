@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tango Android Share · 宿主</title>
+  </head>
+  <body>
+    <main>
+      <h1>Tango Android Share</h1>
+      <p>USB 本地投屏 · 加密远程只读观看</p>
+      <div class="layout">
+        <section>
+          <div class="panel screen">
+            <canvas
+              id="screen"
+              width="720"
+              height="1280"
+              aria-label="Android 实时画面"
+            ></canvas>
+          </div>
+          <p id="stats" class="stats" aria-live="off">等待视频</p>
+        </section>
+        <aside>
+          <section class="panel">
+            <h2>1. 连接 Android 手机</h2>
+            <p class="hint">
+              开启开发者选项与 USB 调试，解锁手机并允许 ADB 授权。USB
+              接口不能同时被其他 ADB 客户端占用。
+            </p>
+            <button id="connect" class="primary">连接 USB 设备</button>
+            <button id="start" disabled>开始投屏</button>
+            <button id="stop" disabled>停止投屏</button>
+            <button id="disconnect" disabled>断开设备</button>
+            <p id="device-status" class="status" role="status">设备未连接。</p>
+          </section>
+          <section class="panel">
+            <h2>2. 远程分享</h2>
+            <label
+              >项目中继地址（HTTPS）
+              <input
+                id="relay"
+                type="url"
+                placeholder="https://share.example.com"
+              />
+            </label>
+            <label
+              >中继创建密钥（由部署者提供）
+              <input
+                id="deployment-token"
+                type="password"
+                autocomplete="off"
+                maxlength="256"
+              />
+            </label>
+            <button id="share" class="primary" disabled>开启远程分享</button>
+            <button id="unshare" disabled>停止并撤销分享</button>
+            <div id="share-link" hidden>
+              <label>观看链接（含访问凭据）<input id="link" readonly /></label>
+              <button id="copy">复制链接</button>
+              <p id="expiry" class="hint"></p>
+            </div>
+            <p id="share-status" class="status" role="status">分享未开启。</p>
+            <p class="hint">
+              只发给获准观看的人。停止分享不影响本地画面；设备断开会结束分享。保持此标签页、Chrome
+              和电脑在线。
+            </p>
+          </section>
+        </aside>
+      </div>
+    </main>
+    <script type="module" src="../src/extension/main.ts"></script>
+  </body>
+</html>
