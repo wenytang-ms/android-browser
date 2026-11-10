@@ -6,9 +6,11 @@
 
 `0.0.3-alpha` 新增本地媒体音频转发：网页播放手机媒体声，手机停止播放被转发的媒体声，保留电话、通知和闹钟。需要 Android 11+；远端暂不传音频，实际设备音频路由仍需真机确认。
 
+`0.0.4-alpha` 新增免 APK、按需读取的本地 UI tree 检视器、节点点击/长按、填文字和滚动，以及按包名启动应用。需要 Android 7+、ADB shell v2；手机端 Android/OEM 兼容性仍需真机确认。`0.0.3-alpha` 及更早 ZIP 不包含这些功能。
+
 ## 开发者构建
 
-需要 Node.js 22.12+（推荐 24）及 npm：
+需要 Node.js 22.12+（推荐 24）、npm 及 JDK 17+（设置 `JAVA_HOME` 或加入 PATH）：
 
 ```powershell
 npm ci
@@ -25,31 +27,33 @@ npm run build
 
 构建时自动下载官方 `scrcpy-server-v2.1`，验证官方 SHA-256 后放入扩展；运行时只读取扩展内的 JAR，不下载远程脚本。Tango 及播放器一起打包。第三方许可证随产物附带在 `third-party-notices.txt` 中。
 
+UI helper 使用 `android\ui-helper\UiTreeServer.java` 构建；构建脚本自动下载 `tools.json` 固定 SHA-256 的官方 Android 编译平台及 R8，缓存于 `node_modules\.cache\tango-ui-build`，无需另装 Android SDK。`npm run prepare:ui-helper` 可单独生成含 DEX 的 `extension\public\ui-helper.jar`，完整构建会将其一起打包。JDK、Node.js 和下载网络仅开发构建需要，扩展用户无需安装它们。
+
 固定版本：`@yume-chan/adb` 2.6.4、WebUSB / adb-scrcpy 2.3.2、scrcpy 协议包 2.3.0、credential-web 2.1.0、stream-extra 2.6.1；使用 `AdbScrcpyOptions2_1` 对接 scrcpy-server 2.1。完整依赖由 `package-lock.json` 锁定。
 
 ## GitHub Release 发布
 
-当前预发布版本为 `0.0.3-alpha`。在 [Releases 页面](https://github.com/wenytang-ms/android-browser/releases) 下载 `tango-android-share-0.0.3-alpha.zip`，解压后在 Chrome 加载包含 `manifest.json` 的目录；附带 `.sha256` 校验文件。该 ZIP 是用于“加载已解压的扩展”的包，不是签名 CRX，也不会自动发布到 Chrome Web Store。
+当前预发布版本为 `0.0.4-alpha`。在 [Releases 页面](https://github.com/wenytang-ms/android-browser/releases) 下载 `tango-android-share-0.0.4-alpha.zip`，解压后在 Chrome 加载包含 `manifest.json` 的目录；附带 `.sha256` 校验文件。该 ZIP 是用于“加载已解压的扩展”的包，不是签名 CRX，也不会自动发布到 Chrome Web Store。
 
 `.github\workflows\release-extension.yml` 支持两种方式：
 
 1. 推送 `v*` 标签自动打包并发布；例如 `v0.0.1-alpha`。
-2. 在 GitHub **Actions → Release Chrome extension → Run workflow** 输入版本，例如 `0.0.3-alpha`，从所选分支提交构建并创建对应标签和 Release。
+2. 在 GitHub **Actions → Release Chrome extension → Run workflow** 输入版本，例如 `0.0.4-alpha`，从所选分支提交构建并创建对应标签和 Release。
 
-流程使用 Node.js 24 和 `npm ci`，先检查格式和回归测试，再构建包含 Tango、scrcpy-server 和许可证的扩展，生成 ZIP 和 SHA-256，并将附件上传到 GitHub Release。带预发布后缀的版本标记为 **Pre-release**；稳定版本正常发布。使用内置 `GITHUB_TOKEN`，无需额外发布密钥。
+流程使用 Node.js 24、JDK 17 和 `npm ci`，先检查格式和回归测试，再构建包含 Tango、scrcpy-server、UI helper 和许可证的扩展，生成 ZIP 和 SHA-256，并将附件上传到 GitHub Release。带预发布后缀的版本标记为 **Pre-release**；稳定版本正常发布。使用内置 `GITHUB_TOKEN`，无需额外发布密钥。
 
 Chrome 的数值版本与显示版本分开：`0.0.1-alpha` 对应 manifest 的 `version: "0.0.1"` 和 `version_name: "0.0.1-alpha"`。发布脚本同时更新 package、lockfile 和 manifest。标签或 Release 已存在时不覆盖其他提交或已有附件，请使用新的版本号。
 
 后续通过标签发布：
 
 ```powershell
-npm run release:version -- 0.0.3-alpha
+npm run release:version -- 0.0.4-alpha
 npm run format
 git add package.json package-lock.json extension\public\manifest.json
-git commit -m "Release 0.0.3-alpha"
-git tag v0.0.3-alpha
+git commit -m "Release 0.0.4-alpha"
+git tag v0.0.4-alpha
 git push origin main
-git push origin v0.0.3-alpha
+git push origin v0.0.4-alpha
 ```
 
 ## 用户：本地投屏
@@ -62,11 +66,39 @@ git push origin v0.0.3-alpha
 
 本地观看及控制均无需 Google 登录、中继或网络。文本粘贴最多 1024 UTF-8 字节，会覆盖手机剪贴板；不读取手机剪贴板。断线、停止及画面尺寸改变时禁用输入，待新画面显示后恢复。不包含录屏或多设备。会话页关闭会结束设备和共享连接。ADB 密钥由 Tango 保存于扩展的 IndexedDB，远端不会获得原始 USB / ADB 访问权。
 
-**本地操作自动接管。** 开启共享后，只要在本地画面点击、拖动、使用键盘或发送文本，远端立即变为只读，视频继续播放；正在按下的远端按键和触点会释放，旧输入队列被取消。宿主重新勾选“允许远端控制”后，远端等待新配置和画面，再恢复操作。断线重连不会绕过宿主设置；远端不能自行开启控制权限。
+**本地操作自动接管。** 开启共享后，只要在本地画面点击、拖动、使用键盘、发送文本、执行节点动作或启动应用，远端立即变为只读，视频继续播放；正在按下的远端按键和触点会释放，旧输入队列被取消。宿主重新勾选“允许远端控制”后，远端等待新配置和画面，再恢复操作。断线重连不会绕过宿主设置；远端不能自行开启控制权限。
 
 Windows 的 ADB USB 接口必须有 WebUSB 兼容驱动，且不能被 Android Studio、其他 ADB 客户端等程序占用。如无法打开设备，请释放占用并检查 OEM USB 驱动 / WinUSB 兼容性；不要替换手机其他接口（例如 MTP）的驱动。免安装 ADB 不代表无需驱动验证。
 
 scrcpy 2.1 上游支持 Android 5.0+；本项目实际 Android / OEM 编码器和 Windows 驱动兼容范围尚需设备实测，不能把上游范围当成已验证范围。
+
+## 用户：按需读取 UI tree（0.0.4-alpha）
+
+开始投屏并显示画面后，点击 **“读取当前 UI tree”**。首次调用将随扩展打包的辅助 JAR 推送至手机 `/data/local/tmp`，通过当前已授权的 ADB shell v2 启动 `app_process` / `UiAutomation`。之后复用该进程，只有点击读取才采集当前活动窗口；不会主动刷新 UI 树，也不订阅用于业务刷新的无障碍事件。无需安装 APK 或手动启用 AccessibilityService，不占用新的手机监听端口，不要求电脑运行额外程序。
+
+节点可以按文字、描述、资源 ID 或类名筛选。选择节点只显示 JSON 属性，并按手机屏幕坐标在视频上近似高亮，不会点击手机，也不影响画面触控；只有点击 **“执行节点动作”** 才操作手机。每次读取返回独立快照；操作手机后需重新读取，快照与视频不是原子同步。画面流变化时清除旧快照，屏幕比例不匹配时不显示高亮。当前仅支持默认显示屏的活动窗口，不是完整 View 树、HTML DOM 或所有窗口；自绘、合并语义及受保护界面可能没有完整节点。
+
+内部入口为 `DeviceSession.getUiTree()`，返回带画面流代次的 `LocalUiTreeSnapshot`：采集序号、随机 `snapshotRef`、动作剩余有效期 `expiresInMs`、手机单调时钟 `capturedAtMs`、耗时、显示尺寸/旋转、扁平父子节点与 `truncated` 标记。节点含资源 ID、类名、包名、文本、描述、边界、可点击/可编辑等状态及声明支持的 `actions`。最多 2000 节点、深度 64、每个文本字段 1024 字符；数量/大小/深度/文本超限会明确标记截断，遍历超时或无活动根节点则返回错误，不回退旧树。helper 启动限时 20 秒、单次读取或动作限时 8 秒，同一时刻只允许一个请求。
+
+节点动作通过现有免 APK helper 调用 `AccessibilityNodeInfo.performAction()`，不需要另装 AccessibilityService。内部入口为 `DeviceSession.performUiAction({ stream, snapshotRef, nodeId, action, ... })`；支持 `click`、`longClick`、`setText`、`scrollForward` / `scrollBackward` 及节点声明支持的 `scrollUp` / `scrollDown` / `scrollLeft` / `scrollRight`。`setText` 需附 `text`，最多 1024 UTF-8 字节，允许空字符串清空；不修改剪贴板，密码节点的输入框会隐藏文字，执行后清空输入。只有启用、可见且声明支持相应动作的节点可执行，不自动选择父节点或用坐标点击兜底。任意坐标点击、滑动和拖拽仍使用原有 Tango 输入。
+
+每次快照在手机仅保留一组有界节点引用，最长 30 秒，超时自动释放；新读取替换旧引用，动作尝试后整组引用释放。手机执行前检查活动根窗口、显示尺寸/旋转、节点刷新及关键属性是否一致，并重新检查动作支持情况。本地或远端的普通输入使浏览器引用失效，读取期间有输入则拒绝该快照用于动作。执行节点动作遵守本地优先接管，与 Tango 共用有界输入队列并先释放按下的触点/按键。界面只列出该节点支持的动作；过期或动作后需重新读取，不自动刷新、重试或回退坐标触控。
+
+`accepted: true` 仅表示 Android 节点动作返回已处理，不保证页面已完成业务目标，仍需按需读取确认。动作超时、断线或执行中关闭 helper 时结果可能未知，不能直接重试以免重复操作。失败和节点变化会独立显示错误，不停止正常媒体或输入；输入释放本身失败则沿用原有停止/恢复流程。helper RPC 为协议 2，旧协议或回执不匹配时关闭 helper，不接受旧节点序号。
+
+密码节点的文本和描述在手机与浏览器两端清除；其他普通文本仍可能包含隐私，请勿将真实树粘贴到公开 issue。快照只在宿主页内存展示，不写入存储、不记录原始树或手机 stderr，不传给远端或中继。**“关闭 helper 并清除快照”** 会结束辅助进程并删除本次临时 JAR，投屏、声音和触控继续；手动停止投屏或断开设备也会清理，自动重建视频则保留 helper。断连/强制关闭时依赖 shell 标准输入关闭使进程退出，无法保证删除断连手机上的临时 JAR；错误会明确提示，清理不会无限阻塞投屏资源释放。
+
+需要 **Android 7+、ADB shell v2**。该方案使用 Android 的隐藏引导接口，Android/OEM 兼容性及其他 UI 自动化工具占用可能导致失败；浏览器会独立显示错误，不停止正常投屏/控制。Redmi K40 手机端尚未实测，不能把编译及浏览器模拟测试当作真机验证。此阶段不提供 XML/XPath、Accessibility 手势、外部扩展消息、远程 UI tree/节点动作、HTTP 桥或 MCP。
+
+## 用户：按包名启动应用（0.0.4-alpha）
+
+开始投屏并显示画面后，在 **“启动应用（仅本地）”** 输入包名，例如 `com.android.settings`，点击 **“启动应用”**。内部入口为 `DeviceSession.launchApp(packageName)`，复用已授权的 Tango ADB shell v2，无需启动 UI helper，也不安装 APK 或额外桌面程序。
+
+只接受最长 255 字符、点分隔的 Android 包名，不接受命令、Activity、链接或额外参数。查询当前 Android 用户下的 `MAIN` / `LAUNCHER` 入口，选择系统返回的第一个组件，以 `NEW_TASK | RESET_TASK_IF_NEEDED` 启动或返回已有任务；不强制停止、清数据或安装应用。没有桌面入口、未安装/已停用、权限拒绝、命令不兼容或未获成功回执时明确报错，不用 `monkey` 或坐标点击兜底。
+
+启动与 Tango 输入共用队列，先释放已有触点/按键并按本地优先规则撤销远端控制，使旧 UI 节点引用失效。进行中暂停本地输入及 UI tree 读取，但保留停止、断开和媒体播放。总限时 15 秒，输出合计上限 64 KiB；停止、断开或重建视频会取消等待，不自动重试。超时/中断可能已启动手机应用，须确认当前页面。
+
+返回 `{ packageName, component, accepted: true }` 仅表示 Android `am start -W` 报告成功，不表示首页加载完成、目标应用已解锁或广告已跳过。之后应按需 `getUiTree()`，再执行当前节点动作并重新读取确认。启动不绕过锁屏、登录、广告限制或工作资料策略，不提供应用枚举、多用户选择、深链、外部 Agent 接口或 MCP。需要 Android 7+、ADB shell v2；手机端实际权限和 OEM 行为仍需真机确认。
 
 ## 用户：本地网页声音
 
@@ -226,6 +258,7 @@ npm run test:browser
 - Google 登录失败：检查 OAuth Client 类型、同意屏幕测试用户、`PUBLIC_URL` 对应的精确回调地址及服务端 Client ID/Secret；远端必须选择共享创建者的同一账号。
 - 输入暂不可用：等待新画面完成显示；断线、旋转和重新同步期间禁用输入。中文使用文本框粘贴；部分 OEM 还要求在手机开启额外的 USB 调试安全/输入授权。
 - 网页没有声音：检查是否启用媒体转发和网页声音、Chrome/Windows 的输出音量及设备是否 Android 11+；Android 11 先解锁再开始。手机音量不能设为零来实现音频转发。若捕获不可用或应用限制捕获，查看页面音频提示；恢复手机发声可停止投屏或停止后禁用音频再开始。
+- UI tree 读取失败：先等待画面、正常解锁手机并重试；关闭其他 UiAutomator/Instrumentation 工具。无活动根节点、读取超时及 Android/OEM 隐藏接口不兼容均有独立提示；可关闭 helper 后重新读取，投屏和输入不受影响。
 - 已被其他人观看：当前仅一个在线观看者；让已有观看者结束，或撤销后重新建立分享。
 - 旧链接无法恢复：会话过期、撤销、宿主超时离线或中继重启后必须使用新链接。
 

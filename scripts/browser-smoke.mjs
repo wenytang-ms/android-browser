@@ -419,6 +419,8 @@ try {
     { parameterSets, fixture },
   );
   assert.equal(await localPage.locator("#local-back").isDisabled(), true);
+  assert.equal(await localPage.locator("#ui-read").isDisabled(), true);
+  assert.equal(await localPage.locator("#launch-app").isDisabled(), true);
   await localPage.locator("#connect").click();
   await localPage.waitForFunction(
     () =>
@@ -427,6 +429,292 @@ try {
   );
   await localPage.waitForFunction(fixtureHasAudio);
   assert.equal(await localPage.locator("#audio-forward").isDisabled(), true);
+  assert.equal(
+    await localPage.evaluate(() => globalThis.tangoFixture.uiCaptures),
+    0,
+  );
+  await localPage.locator("#ui-read").click();
+  await localPage.waitForFunction(
+    () => document.querySelectorAll("#ui-tree button").length === 3,
+  );
+  assert.equal(await localPage.locator("#ui-tree b").count(), 0);
+  assert(
+    (await localPage.locator('[data-ui-node="1"]').textContent()).includes(
+      "Settings <b>safe</b>",
+    ),
+  );
+  await localPage.locator('[data-ui-node="2"]').click();
+  const passwordNode = JSON.parse(
+    await localPage.locator("#ui-details").textContent(),
+  );
+  assert.equal(passwordNode.text, "");
+  assert.equal(passwordNode.description, "");
+  assert(
+    !(await localPage.locator("#ui-tree").textContent()).includes(
+      "fixture-password",
+    ),
+  );
+  await localPage.locator("#ui-search").fill("settings");
+  assert.equal(await localPage.locator("#ui-tree button").count(), 1);
+  await localPage.locator("#ui-search").fill("");
+  await localPage.locator('[data-ui-node="1"]').click();
+  assert.equal(await localPage.locator("#ui-highlight").isVisible(), true);
+  const overlay = await localPage.evaluate(() => {
+    const canvas = document.querySelector("#screen").getBoundingClientRect();
+    const highlight = document
+      .querySelector("#ui-highlight")
+      .getBoundingClientRect();
+    return {
+      left: Math.abs(highlight.left - canvas.left - (canvas.width * 8) / 64),
+      top: Math.abs(highlight.top - canvas.top - (canvas.height * 8) / 64),
+      width: Math.abs(highlight.width - (canvas.width * 32) / 64),
+      height: Math.abs(highlight.height - (canvas.height * 24) / 64),
+    };
+  });
+  assert(
+    Object.values(overlay).every((distance) => distance < 2),
+    "UI bounds must match the scaled canvas.",
+  );
+  const beforeOverlayClick = await localPage.evaluate(
+    () => globalThis.tangoFixture.inputs.length,
+  );
+  const screenSize = await localPage.locator("#screen").boundingBox();
+  assert(screenSize);
+  await localPage
+    .locator("#screen")
+    .click({ position: { x: screenSize.width / 4, y: screenSize.height / 4 } });
+  await localPage.waitForFunction(
+    (previous) => globalThis.tangoFixture.inputs.length > previous,
+    beforeOverlayClick,
+  );
+  assert.equal(
+    await localPage.locator("#ui-node-execute").isDisabled(),
+    true,
+    "Tango input must invalidate node action references.",
+  );
+  const beforeWait = await localPage.evaluate(
+    () => globalThis.tangoFixture.audioPackets,
+  );
+  await localPage.waitForFunction(
+    (previous) => globalThis.tangoFixture.audioPackets > previous + 60,
+    beforeWait,
+  );
+  assert.equal(
+    await localPage.evaluate(() => globalThis.tangoFixture.uiCaptures),
+    1,
+    "Video frames must not trigger UI captures.",
+  );
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.failUiTree = true;
+  });
+  await localPage.locator("#ui-read").click();
+  await localPage.waitForFunction(() =>
+    document
+      .querySelector("#ui-status")
+      .textContent.includes("Synthetic UI root unavailable."),
+  );
+  assert.equal(await localPage.locator("#ui-tree button").count(), 0);
+  assert.equal(await localPage.locator("#ui-highlight").isVisible(), false);
+  assert.equal(await localPage.locator("#local-home").isEnabled(), true);
+  await localPage.waitForFunction(fixtureHasAudio);
+  await localPage.locator("#ui-stop").click();
+  await localPage.waitForFunction(() =>
+    document
+      .querySelector("#ui-status")
+      .textContent.includes("UI helper 已关闭"),
+  );
+  assert.equal(
+    await localPage.evaluate(() => globalThis.tangoFixture.uiStops),
+    1,
+  );
+  assert.equal(await localPage.locator("#ui-stop").isDisabled(), true);
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.failUiTree = false;
+  });
+  await localPage.locator("#ui-read").click();
+  await localPage.waitForFunction(
+    () => document.querySelectorAll("#ui-tree button").length === 3,
+  );
+  async function readUiTree() {
+    await localPage.locator("#ui-read").click();
+    await localPage.waitForFunction(
+      () => document.querySelectorAll("#ui-tree button").length === 3,
+    );
+  }
+  async function performNode(node, action, text) {
+    await localPage.locator(`[data-ui-node="${node}"]`).click();
+    await localPage.locator("#ui-node-action").selectOption(action);
+    if (text !== undefined) {
+      assert.equal(
+        await localPage.locator("#ui-node-text").getAttribute("type"),
+        "password",
+      );
+      await localPage.locator("#ui-node-text").fill(text);
+    }
+    await localPage.locator("#ui-node-execute").click();
+  }
+  const beforeNodeInputs = await localPage.evaluate(
+    () =>
+      globalThis.tangoFixture.inputs.filter(
+        ({ event }) => event.kind === "touch" || event.kind === "text",
+      ).length,
+  );
+  assert.equal(
+    await localPage.evaluate(() => globalThis.tangoFixture.uiActions.length),
+    0,
+  );
+  await localPage.locator('[data-ui-node="1"]').click();
+  assert.deepEqual(
+    await localPage
+      .locator("#ui-node-action option")
+      .evaluateAll((options) => options.map((option) => option.value)),
+    ["click", "longClick"],
+  );
+  const semanticCases = [
+    { node: 1, action: "click" },
+    { node: 1, action: "longClick" },
+    { node: 2, action: "setText", text: "\u4f60\u597d" },
+    { node: 2, action: "setText", text: "" },
+    { node: 0, action: "scrollForward" },
+    { node: 0, action: "scrollBackward" },
+  ];
+  for (const [index, action] of semanticCases.entries()) {
+    if (index) await readUiTree();
+    await performNode(action.node, action.action, action.text);
+    await localPage.waitForFunction(() =>
+      document
+        .querySelector("#ui-status")
+        .textContent.includes("Android 已接受"),
+    );
+    assert.equal(await localPage.locator("#ui-tree button").count(), 0);
+    assert.equal(
+      await localPage.locator("#ui-node-execute").isDisabled(),
+      true,
+    );
+    assert.equal(await localPage.locator("#ui-node-text").inputValue(), "");
+  }
+  assert.deepEqual(
+    await localPage.evaluate(() =>
+      globalThis.tangoFixture.uiActions.map(({ nodeId, action, text }) => ({
+        node: nodeId,
+        action,
+        ...(text !== undefined ? { text } : {}),
+      })),
+    ),
+    semanticCases,
+  );
+  await readUiTree();
+  await localPage.locator('[data-ui-node="2"]').click();
+  await localPage.locator("#ui-node-text").fill("\u4f60".repeat(342));
+  await localPage.locator("#ui-node-execute").click();
+  await localPage.waitForFunction(() =>
+    document.querySelector("#ui-status").textContent.includes("节点动作未发送"),
+  );
+  assert.equal(await localPage.locator("#ui-tree button").count(), 3);
+  assert.equal(
+    await localPage.evaluate(() => globalThis.tangoFixture.uiActions.length),
+    semanticCases.length,
+  );
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.uiExpiryMs = 80;
+  });
+  await readUiTree();
+  await localPage.waitForFunction(() =>
+    document.querySelector("#ui-status").textContent.includes("引用已过期"),
+  );
+  assert.equal(await localPage.locator("#ui-node-execute").isDisabled(), true);
+  assert.equal(await localPage.locator("#ui-tree button").count(), 3);
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.uiExpiryMs = 30_000;
+    globalThis.tangoFixture.failUiAction = true;
+  });
+  await readUiTree();
+  await performNode(1, "click");
+  await localPage.waitForFunction(() =>
+    document
+      .querySelector("#ui-status")
+      .textContent.includes("Synthetic ACTION_REJECTED."),
+  );
+  assert.equal(await localPage.locator("#ui-tree button").count(), 0);
+  assert.equal(
+    await localPage.evaluate(
+      () =>
+        globalThis.tangoFixture.inputs.filter(
+          ({ event }) => event.kind === "touch" || event.kind === "text",
+        ).length,
+    ),
+    beforeNodeInputs,
+    "Semantic actions must not fall back to Tango input.",
+  );
+  assert.equal(await localPage.locator("#local-home").isEnabled(), true);
+  await localPage.waitForFunction(fixtureHasAudio);
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.failUiAction = false;
+  });
+  await readUiTree();
+  await localPage.locator("#app-package").fill("com.example.app;id");
+  await localPage.locator("#launch-app").click();
+  assert(
+    (await localPage.locator("#app-launch-status").textContent()).includes(
+      "应用未启动",
+    ),
+  );
+  assert.equal(
+    await localPage.evaluate(() => globalThis.tangoFixture.appLaunches.length),
+    0,
+  );
+  assert.equal(await localPage.locator("#ui-tree button").count(), 3);
+  const beforeLaunchCaptures = await localPage.evaluate(
+    () => globalThis.tangoFixture.uiCaptures,
+  );
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.holdAppLaunch = true;
+  });
+  await localPage.locator("#app-package").fill(" com.android.settings ");
+  await localPage.locator("#launch-app").click();
+  await localPage.waitForFunction(
+    () => !!globalThis.tangoFixture.completeAppLaunch,
+  );
+  assert.equal(await localPage.locator("#launch-app").isDisabled(), true);
+  assert.equal(await localPage.locator("#ui-read").isDisabled(), true);
+  assert.equal(await localPage.locator("#local-home").isDisabled(), true);
+  assert.equal(await localPage.locator("#stop").isEnabled(), true);
+  assert.equal(await localPage.locator("#disconnect").isEnabled(), true);
+  assert.equal(await localPage.locator("#ui-tree button").count(), 0);
+  await localPage.waitForFunction(fixtureHasAudio);
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.completeAppLaunch();
+  });
+  await localPage.waitForFunction(() =>
+    document
+      .querySelector("#app-launch-status")
+      .textContent.includes("Android 已接受"),
+  );
+  assert.deepEqual(
+    await localPage.evaluate(() => globalThis.tangoFixture.appLaunches),
+    ["com.android.settings"],
+  );
+  assert.equal(
+    await localPage.evaluate(() => globalThis.tangoFixture.uiCaptures),
+    beforeLaunchCaptures,
+  );
+  assert.equal(await localPage.locator("#launch-app").isEnabled(), true);
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.holdAppLaunch = false;
+    globalThis.tangoFixture.failAppLaunch = true;
+  });
+  await localPage.locator("#launch-app").click();
+  await localPage.waitForFunction(() =>
+    document
+      .querySelector("#app-launch-status")
+      .textContent.includes("Synthetic app launch rejected"),
+  );
+  assert.equal(await localPage.locator("#local-home").isEnabled(), true);
+  await localPage.waitForFunction(fixtureHasAudio);
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.failAppLaunch = false;
+  });
+  await readUiTree();
   await localPage.locator("#audio-toggle").click();
   await localPage.waitForFunction(() =>
     document.querySelector("#audio-status").textContent.includes("网页已静音"),
@@ -465,6 +753,11 @@ try {
     document.querySelector("#screen-status").textContent.includes("已请求息屏"),
   );
   await localPage.waitForFunction(fixtureHasAudio);
+  assert.equal(
+    await localPage.locator("#ui-tree button").count(),
+    3,
+    "Display power changes must not invalidate the UI session.",
+  );
   await localPage.locator("#screen").click();
   const bounds = await localPage.locator("#screen").boundingBox();
   assert(bounds, "Local canvas must be visible.");
@@ -534,6 +827,42 @@ try {
         source === "remote" && event.kind === "key" && event.keyCode === 20,
     ),
   );
+  await localPage.bringToFront();
+  await readUiTree();
+  await performNode(1, "click");
+  await localPage.waitForFunction(() =>
+    document.querySelector("#ui-status").textContent.includes("Android 已接受"),
+  );
+  await page.waitForFunction(
+    () => document.querySelector("#controls").disabled,
+  );
+  assert.equal(await localPage.locator("#remote-control").isChecked(), false);
+  await localPage.locator("#remote-control").check();
+  await page.waitForFunction(
+    () => !document.querySelector("#controls").disabled,
+  );
+  await localPage.locator("#app-package").fill("com.example.app;id");
+  await localPage.locator("#launch-app").click();
+  assert.equal(
+    await localPage.locator("#remote-control").isChecked(),
+    true,
+    "Invalid package names must not revoke remote control.",
+  );
+  await localPage.locator("#app-package").fill("com.android.settings");
+  await localPage.locator("#launch-app").click();
+  await localPage.waitForFunction(() =>
+    document
+      .querySelector("#app-launch-status")
+      .textContent.includes("Android 已接受"),
+  );
+  await page.waitForFunction(
+    () => document.querySelector("#controls").disabled,
+  );
+  assert.equal(await localPage.locator("#remote-control").isChecked(), false);
+  await localPage.locator("#remote-control").check();
+  await page.waitForFunction(
+    () => !document.querySelector("#controls").disabled,
+  );
   await localPage.locator("#screen").click();
   await page.waitForFunction(
     () =>
@@ -601,7 +930,35 @@ try {
     ),
     "Stopping only remote sharing must not change the phone display mode.",
   );
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.holdAppLaunch = true;
+  });
+  await localPage.locator("#launch-app").click();
+  await localPage.waitForFunction(
+    () => !!globalThis.tangoFixture.completeAppLaunch,
+  );
   await localPage.locator("#stop").click();
+  await localPage.waitForFunction(() =>
+    document
+      .querySelector("#app-launch-status")
+      .textContent.includes("结果可能未知"),
+  );
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.completeAppLaunch();
+  });
+  await localPage.waitForFunction(
+    () => !globalThis.tangoFixture.completeAppLaunch,
+  );
+  assert(
+    (await localPage.locator("#app-launch-status").textContent()).includes(
+      "结果可能未知",
+    ),
+    "Late launch success must not overwrite cancellation.",
+  );
+  assert.equal(await localPage.locator("#launch-app").isDisabled(), true);
+  assert.equal(await localPage.locator("#ui-tree button").count(), 0);
+  assert.equal(await localPage.locator("#ui-read").isDisabled(), true);
+  assert.equal(await localPage.locator("#ui-stop").isDisabled(), true);
   assert.equal(await localPage.locator("#local-home").isDisabled(), true);
   assert.equal(await localPage.locator("#screen-off").isDisabled(), true);
   assert.equal(await localPage.locator("#screen-on").isDisabled(), true);
@@ -659,7 +1016,7 @@ try {
   );
   assert.equal(errors.length, 0, `Viewer runtime errors: ${errors.join("; ")}`);
   console.log(
-    "Browser host: real Web Audio PCM output, mute/resume and cleanup, audio opt-out/unavailability, local/remote input, screen-off and local takeover passed (synthetic device session).",
+    "Browser host: package app launch/cancellation, on-demand UI tree, semantic click/long-click/set-text/scroll, one-shot/expired references, no coordinate fallback, safe text/password handling, scaled highlights, Web Audio PCM, local/remote input, screen-off and local takeover passed (synthetic device session).",
   );
 } finally {
   hostControl?.terminate();

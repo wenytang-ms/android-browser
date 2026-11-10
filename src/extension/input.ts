@@ -124,12 +124,48 @@ export class DeviceInputController {
   onReleaseError: (error: unknown) => void = (error) =>
     console.error("Device input release failed:", error);
 
-  private enqueue(operation: () => Promise<void>): Promise<void> {
+  execute<T>(
+    id: string,
+    stream: number,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (!this.controller || id !== this.controller)
+      return Promise.reject(new Error("输入控制授权已失效。"));
+    if (this.pending >= 32)
+      return Promise.reject(
+        new Error("设备输入积压，请停止操作并重新开始投屏。"),
+      );
+    const generation = this.generation;
+    return this.enqueue(async () => {
+      if (generation !== this.generation)
+        throw new Error("设备动作已取消：输入控制权已改变。");
+      if (this.screen()?.stream !== stream)
+        throw new Error("设备动作对应的画面已经改变，请等待新画面。");
+      try {
+        await this.releaseHeld();
+      } catch (error) {
+        if (generation === this.generation) {
+          this.controller = null;
+          ++this.generation;
+        }
+        this.onReleaseError(error);
+        throw error;
+      }
+      if (generation !== this.generation || this.screen()?.stream !== stream)
+        throw new Error("设备动作已取消：输入控制权或画面已改变。");
+      return operation();
+    });
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
     ++this.pending;
     const result = this.tail.then(operation).finally(() => {
       --this.pending;
     });
-    this.tail = result.catch(() => {});
+    this.tail = result.then(
+      () => {},
+      () => {},
+    );
     return result;
   }
 

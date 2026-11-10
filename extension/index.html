@@ -19,8 +19,63 @@
               height="1280"
               aria-label="Android 实时画面"
             ></canvas>
+            <div
+              id="ui-highlight"
+              class="ui-highlight"
+              hidden
+              aria-hidden="true"
+            ></div>
           </div>
           <p id="stats" class="stats" aria-live="off">等待视频</p>
+          <section class="panel">
+            <h2>UI tree 与节点动作（仅本地）</h2>
+            <button id="ui-read" disabled>读取当前 UI tree</button>
+            <button id="ui-stop" disabled>关闭 helper 并清除快照</button>
+            <p id="ui-status" class="status" role="status">等待投屏画面。</p>
+            <p class="hint">
+              Android 7+，免 APK；首次读取会推送并启动辅助
+              JAR。只按请求读取活动窗口，
+              不自动刷新、不传远端、不写入存储。自绘界面可能没有完整节点。
+              选择下方节点只查看属性和高亮，不会点击手机。
+              点击“执行节点动作”才会操作手机，并按本地优先规则接管控制。
+            </p>
+            <label
+              >筛选节点<input
+                id="ui-search"
+                type="search"
+                maxlength="256"
+                placeholder="文字、描述、资源 ID 或类名"
+            /></label>
+            <ul
+              id="ui-tree"
+              class="ui-tree"
+              aria-label="当前活动窗口 UI tree"
+            ></ul>
+            <pre id="ui-details" class="ui-details">
+选择树节点查看属性，不会操作手机。</pre
+            >
+            <fieldset id="ui-node-controls" disabled>
+              <legend>所选节点动作</legend>
+              <label>动作<select id="ui-node-action"></select></label>
+              <label
+                >设置文字（最多 1024 UTF-8 字节）
+                <input
+                  id="ui-node-text"
+                  type="text"
+                  autocomplete="off"
+                  maxlength="1024"
+                  disabled
+                  hidden
+                />
+              </label>
+              <button id="ui-node-execute">执行节点动作</button>
+              <p class="hint">
+                仅列出节点声明支持的动作。引用最多有效 30
+                秒，执行后需重新读取；不自动重试、不回退坐标点击。坐标触控继续使用
+                Tango。
+              </p>
+            </fieldset>
+          </section>
           <section class="panel">
             <h2>本地声音</h2>
             <label class="toggle">
@@ -35,6 +90,32 @@
               仅本地网页播放，不传到远端，不采集麦克风。转发时手机不外放被转发的媒体声，
               电话、通知和闹钟不受影响。网页静音不会恢复手机发声；停止投屏后恢复。
               需要 Android 11+；Android 11 启动采集前请先解锁。
+            </p>
+          </section>
+          <section class="panel">
+            <h2>启动应用（仅本地）</h2>
+            <form id="app-launch-form">
+              <fieldset id="app-launch-controls" disabled>
+                <label
+                  >Android 包名
+                  <input
+                    id="app-package"
+                    type="text"
+                    maxlength="255"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="com.android.settings"
+                  />
+                </label>
+                <button id="launch-app" type="submit">启动应用</button>
+              </fieldset>
+            </form>
+            <p id="app-launch-status" class="status" role="status">
+              开始投屏后可按包名启动应用。
+            </p>
+            <p class="hint">
+              Android
+              7+，仅启动当前用户下已安装且有桌面入口的应用；不安装应用、不解锁、不自动跳广告。启动会按本地优先规则接管控制，并使旧节点引用失效。
             </p>
           </section>
           <fieldset id="local-controls" class="panel" disabled>

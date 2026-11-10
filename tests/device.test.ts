@@ -2,6 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReadableStream } from "@yume-chan/stream-extra";
 import type { ReadableStreamDefaultController } from "@yume-chan/stream-extra";
 import { DeviceSession } from "../src/extension/device.js";
+import { UiTreeSession } from "../src/extension/ui-tree.js";
+import { AppLauncher } from "../src/extension/app-launch.js";
+import { uiTreeFixture } from "./ui-tree-fixture.js";
+import { parseUiNodeAction } from "../src/shared/ui-tree.js";
 import type { MediaPacket } from "../src/shared/protocol.js";
 import type {
   ScrcpyControlMessageWriter,
@@ -53,7 +57,8 @@ vi.mock("@yume-chan/adb-daemon-webusb", () => ({
     BROWSER: { requestDevice: services.requestDevice },
   },
 }));
-vi.mock("@yume-chan/adb", () => ({
+vi.mock("@yume-chan/adb", async (original) => ({
+  ...(await original<typeof import("@yume-chan/adb")>()),
   AdbDaemonTransport: { authenticate: services.authenticate },
   Adb: class {
     constructor(readonly transport: object) {}
@@ -224,6 +229,343 @@ describe("single Tango device lifecycle", () => {
       expect.stringContaining("transport close failed"),
     );
     expect(logged).toHaveBeenCalled();
+  });
+
+  it("starts the UI helper only on request, reuses it across video recovery and closes it independently", async () => {
+    const helper = new UiTreeSession(async () => {
+      throw new Error("Unexpected helper launch");
+    });
+    const capture = vi
+      .spyOn(helper, "capture")
+      .mockResolvedValue(uiTreeFixture());
+    const close = vi.spyOn(helper, "close").mockResolvedValue();
+    const factory = vi.spyOn(UiTreeSession, "forAdb").mockReturnValue(helper);
+    await expect(device.getUiTree()).rejects.toThrow("先开始投屏");
+    await device.connect();
+    expect(factory).not.toHaveBeenCalled();
+    device.configuration = screen;
+    await expect(device.getUiTree()).resolves.toHaveProperty("stream", 1);
+    await device.getUiTree();
+    expect(capture).toHaveBeenCalledTimes(2);
+    expect(factory).toHaveBeenCalledOnce();
+    await device.restartVideo();
+    expect(close).not.toHaveBeenCalled();
+    expect(device.uiTreeActive).toBe(true);
+    device.configuration = { ...screen, stream: 2 };
+    await device.getUiTree();
+    expect(factory).toHaveBeenCalledOnce();
+    await device.stopUiTree();
+    expect(close).toHaveBeenCalledOnce();
+    expect(device.playing).toBe(true);
+    expect(device.uiTreeActive).toBe(false);
+    await device.localInput({ kind: "text", text: "still usable" }, 2);
+    expect(clients[1].controller.setClipboard).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a UI snapshot from an old video stream and leaves input usable after a helper error", async () => {
+    const helper = new UiTreeSession(async () => {
+      throw new Error("Unexpected helper launch");
+    });
+    const capture = vi.spyOn(helper, "capture");
+    vi.spyOn(UiTreeSession, "forAdb").mockReturnValue(helper);
+    await device.connect();
+    device.configuration = screen;
+    let finish!: (tree: ReturnType<typeof uiTreeFixture>) => void;
+    capture.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const pending = expect(device.getUiTree()).rejects.toThrow("画面已改变");
+    device.configuration = { ...screen, stream: 2 };
+    finish(uiTreeFixture());
+    await pending;
+    capture.mockRejectedValueOnce(new Error("ROOT_UNAVAILABLE"));
+    await expect(device.getUiTree()).rejects.toThrow("ROOT_UNAVAILABLE");
+    await device.localInput({ kind: "text", text: "after helper failure" }, 2);
+    expect(clients[0].controller.setClipboard).toHaveBeenCalledOnce();
+    expect(device.playing).toBe(true);
+    expect(clients[0].close).not.toHaveBeenCalled();
+  });
+
+  it("releases held input, restores display and closes scrcpy even if UI helper cleanup fails", async () => {
+    const helper = new UiTreeSession(async () => {
+      throw new Error("Unexpected helper launch");
+    });
+    vi.spyOn(helper, "capture").mockResolvedValue(uiTreeFixture());
+    const close = vi
+      .spyOn(helper, "close")
+      .mockRejectedValue(new Error("helper cleanup failed"));
+    vi.spyOn(UiTreeSession, "forAdb").mockReturnValue(helper);
+    await device.connect();
+    device.configuration = screen;
+    await device.getUiTree();
+    await device.localInput(
+      { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+      1,
+    );
+    await device.setScreenOff(true);
+    await expect(device.stop()).rejects.toThrow("helper cleanup failed");
+    expect(close).toHaveBeenCalledOnce();
+    expect(clients[0].controller.injectKeyCode).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: 1 }),
+    );
+    expect(clients[0].controller.setScreenPowerMode).toHaveBeenLastCalledWith(
+      AndroidScreenPowerMode.Normal,
+    );
+    expect(clients[0].close).toHaveBeenCalledOnce();
+    expect(device.uiTreeActive).toBe(false);
+  });
+
+  it("takes local control for semantic actions, releases remote held input and never uses a coordinate fallback", async () => {
+    const helper = new UiTreeSession(async () => {
+      throw new Error("Unexpected helper launch");
+    });
+    vi.spyOn(helper, "capture").mockResolvedValue(uiTreeFixture());
+    vi.spyOn(helper, "validateAction").mockImplementation(parseUiNodeAction);
+    const action = vi
+      .spyOn(helper, "performAction")
+      .mockImplementation(async (request) => ({
+        snapshotRef: request.snapshotRef,
+        nodeId: request.nodeId,
+        action: request.action,
+        accepted: true,
+      }));
+    vi.spyOn(UiTreeSession, "forAdb").mockReturnValue(helper);
+    const request = {
+      snapshotRef: uiTreeFixture().snapshotRef,
+      nodeId: 1,
+      action: "click",
+      stream: 1,
+    } as const;
+    await expect(device.performUiAction(request)).rejects.toThrow("已失效");
+    await device.connect();
+    device.configuration = screen;
+    const remote = "a".repeat(32);
+    await device.setRemoteController(remote);
+    await device.remoteInput(
+      remote,
+      { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+      1,
+    );
+    await device.getUiTree();
+    await expect(device.performUiAction(request)).resolves.toHaveProperty(
+      "accepted",
+      true,
+    );
+    expect(clients[0].controller.injectKeyCode).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: 1 }),
+    );
+    expect(
+      clients[0].controller.injectKeyCode.mock.invocationCallOrder.at(-1)!,
+    ).toBeLessThan(action.mock.invocationCallOrder[0]);
+    await expect(
+      device.remoteInput(
+        remote,
+        { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+        1,
+      ),
+    ).rejects.toThrow("授权");
+    await expect(
+      device.performUiAction({ ...request, stream: 2 }),
+    ).rejects.toThrow("已失效");
+    await device.getUiTree();
+    action.mockRejectedValueOnce(new Error("ACTION_REJECTED"));
+    await expect(device.performUiAction(request)).rejects.toThrow(
+      "ACTION_REJECTED",
+    );
+    expect(clients[0].controller.injectTouch).not.toHaveBeenCalled();
+    expect(clients[0].controller.setClipboard).not.toHaveBeenCalled();
+    expect(clients[0].close).not.toHaveBeenCalled();
+    expect(device.playing).toBe(true);
+    await device.localInput({ kind: "text", text: "Tango still available" }, 1);
+    expect(clients[0].controller.setClipboard).toHaveBeenCalledOnce();
+  });
+
+  it("invalidates a pending snapshot after real input but not after a release-only event", async () => {
+    const helper = new UiTreeSession(async () => {
+      throw new Error("Unexpected helper launch");
+    });
+    const capture = vi.spyOn(helper, "capture");
+    vi.spyOn(UiTreeSession, "forAdb").mockReturnValue(helper);
+    await device.connect();
+    device.configuration = screen;
+    let finish!: (value: ReturnType<typeof uiTreeFixture>) => void;
+    capture.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const first = device.getUiTree();
+    await device.localInput({ kind: "release" }, 1);
+    finish(uiTreeFixture());
+    await expect(first).resolves.toHaveProperty("stream", 1);
+    const second = expect(device.getUiTree()).rejects.toThrow("发生了其他输入");
+    await device.localInput({ kind: "text", text: "changes the UI" }, 1);
+    finish(uiTreeFixture(2));
+    await second;
+  });
+
+  it("launches packages lazily with local takeover, held-input release and UI reference invalidation", async () => {
+    const launcher = new AppLauncher(async () => {
+      throw new Error("Unexpected command");
+    });
+    const launch = vi.spyOn(launcher, "launch").mockResolvedValue({
+      packageName: "com.example.app",
+      component: "com.example.app/.Main",
+      accepted: true,
+    });
+    const factory = vi.spyOn(AppLauncher, "forAdb").mockReturnValue(launcher);
+    const helper = new UiTreeSession(async () => {
+      throw new Error("Unexpected helper");
+    });
+    vi.spyOn(helper, "capture").mockResolvedValue(uiTreeFixture());
+    const invalidate = vi.spyOn(helper, "invalidate");
+    vi.spyOn(UiTreeSession, "forAdb").mockReturnValue(helper);
+    await expect(device.launchApp("com.example.app")).rejects.toThrow(
+      "先开始投屏",
+    );
+    await device.connect();
+    expect(factory).not.toHaveBeenCalled();
+    device.configuration = screen;
+    const remote = "a".repeat(32);
+    await device.setRemoteController(remote);
+    await expect(device.launchApp("com.example.app;id")).rejects.toThrow(
+      "包名",
+    );
+    await device.remoteInput(
+      remote,
+      { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+      1,
+    );
+    await device.getUiTree();
+    const previous = invalidate.mock.calls.length;
+    await expect(device.launchApp("com.example.app")).resolves.toHaveProperty(
+      "accepted",
+      true,
+    );
+    expect(factory).toHaveBeenCalledOnce();
+    expect(launch).toHaveBeenCalledWith("com.example.app");
+    expect(invalidate.mock.calls.length).toBeGreaterThanOrEqual(previous + 2);
+    const writer = clients[0].controller;
+    expect(writer.injectKeyCode).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: 1 }),
+    );
+    expect(writer.injectKeyCode.mock.invocationCallOrder.at(-1)!).toBeLessThan(
+      launch.mock.invocationCallOrder[0],
+    );
+    await expect(
+      device.remoteInput(remote, { kind: "text", text: "not authorized" }, 1),
+    ).rejects.toThrow("授权");
+    expect(writer.injectTouch).not.toHaveBeenCalled();
+    expect(writer.setClipboard).not.toHaveBeenCalled();
+    launch.mockRejectedValueOnce(new Error("No launcher activity"));
+    await expect(device.launchApp("com.example.app")).rejects.toThrow(
+      "No launcher activity",
+    );
+    await device.localInput({ kind: "text", text: "still usable" }, 1);
+    expect(writer.setClipboard).toHaveBeenCalledOnce();
+    expect(device.playing).toBe(true);
+    expect(clients[0].close).not.toHaveBeenCalled();
+  });
+
+  it("blocks captures and concurrent launches, rejects in-flight old trees, and accepts launch-triggered rotation", async () => {
+    let finish!: (value: Awaited<ReturnType<AppLauncher["launch"]>>) => void;
+    const launcher = new AppLauncher(async () => {
+      throw new Error("Unexpected command");
+    });
+    const launch = vi.spyOn(launcher, "launch").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    vi.spyOn(AppLauncher, "forAdb").mockReturnValue(launcher);
+    let finishTree!: (tree: ReturnType<typeof uiTreeFixture>) => void;
+    const helper = new UiTreeSession(async () => {
+      throw new Error("Unexpected helper");
+    });
+    vi.spyOn(helper, "capture").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishTree = resolve;
+        }),
+    );
+    vi.spyOn(UiTreeSession, "forAdb").mockReturnValue(helper);
+    await device.connect();
+    device.configuration = screen;
+    const tree = expect(device.getUiTree()).rejects.toThrow("发生了其他输入");
+    const pending = device.launchApp("com.example.app");
+    await vi.waitFor(() => expect(launch).toHaveBeenCalledOnce());
+    finishTree(uiTreeFixture());
+    await tree;
+    await expect(device.getUiTree()).rejects.toThrow("正在启动");
+    await expect(device.launchApp("com.example.app")).rejects.toThrow(
+      "正在进行",
+    );
+    device.configuration = { ...screen, stream: 2 };
+    finish({
+      packageName: "com.example.app",
+      component: "com.example.app/.Main",
+      accepted: true,
+    });
+    await expect(pending).resolves.toHaveProperty("accepted", true);
+  });
+
+  it.each(["stop", "disconnect", "restartVideo"] as const)(
+    "cancels a pending app launch during %s without waiting for a stalled shell spawn",
+    async (action) => {
+      const spawn = vi.fn<ConstructorParameters<typeof AppLauncher>[0]>(
+        () => new Promise(() => {}),
+      );
+      const launcher = new AppLauncher(spawn);
+      const cancel = vi.spyOn(launcher, "cancel");
+      vi.spyOn(AppLauncher, "forAdb").mockReturnValue(launcher);
+      await device.connect();
+      device.configuration = screen;
+      const pending = expect(
+        device.launchApp("com.example.app"),
+      ).rejects.toThrow("已取消");
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      await device[action]();
+      await pending;
+      expect(cancel).toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("never dispatches a queued app launch after stopping during held-key release", async () => {
+    const launcher = new AppLauncher(async () => {
+      throw new Error("Unexpected command");
+    });
+    const launch = vi.spyOn(launcher, "launch");
+    vi.spyOn(AppLauncher, "forAdb").mockReturnValue(launcher);
+    await device.connect();
+    device.configuration = screen;
+    const writer = clients[0].controller;
+    await device.localInput(
+      { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+      1,
+    );
+    let released!: () => void;
+    writer.injectKeyCode.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          released = resolve;
+        }),
+    );
+    const pending = expect(device.launchApp("com.example.app")).rejects.toThrow(
+      "已取消",
+    );
+    await vi.waitFor(() =>
+      expect(writer.injectKeyCode).toHaveBeenCalledTimes(2),
+    );
+    const stop = device.stop();
+    released();
+    await Promise.all([pending, stop]);
+    expect(launch).not.toHaveBeenCalled();
   });
 
   it("supports local clicks, drags, keys and Unicode paste without a remote share or Google login", async () => {

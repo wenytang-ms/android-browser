@@ -23,6 +23,15 @@ import { checkDecoderSupport } from "../shared/player.js";
 import { errorText } from "../shared/protocol.js";
 import type { MediaPacket, RemoteInput } from "../shared/protocol.js";
 import { DeviceInputController } from "./input.js";
+import { UiTreeSession } from "./ui-tree.js";
+import { AppLauncher } from "./app-launch.js";
+import { parsePackageName } from "../shared/app-launch.js";
+import type { AppLaunchResult } from "../shared/app-launch.js";
+import type {
+  LocalUiTreeSnapshot,
+  LocalUiNodeActionRequest,
+  UiNodeActionResult,
+} from "../shared/ui-tree.js";
 import type {
   LocalAudioPacket,
   LocalAudioStatus,
@@ -42,6 +51,10 @@ export class DeviceSession {
   private client?: DeviceClient;
   private restoreDisplay = false;
   private audioAbort?: AbortController;
+  private uiTree?: UiTreeSession;
+  private uiInputEpoch = 0;
+  private appLauncher?: AppLauncher;
+  private appLaunchPending = false;
   private input?: DeviceInputController;
   private inputController = LOCAL_CONTROLLER;
   private operation = false;
@@ -422,6 +435,7 @@ export class DeviceSession {
     if (!this.playing || !input) throw new Error("设备未在投屏。");
     if (event.kind === "release" && this.inputController !== LOCAL_CONTROLLER)
       return;
+    if (event.kind !== "release") this.invalidateUiActions();
     let release: Promise<void> | undefined;
     if (this.inputController !== LOCAL_CONTROLLER) {
       this.inputController = LOCAL_CONTROLLER;
@@ -435,8 +449,150 @@ export class DeviceSession {
     await this.input?.setController(this.inputController);
   }
 
+  async getUiTree(): Promise<LocalUiTreeSnapshot> {
+    if (this.appLaunchPending)
+      throw new Error("应用正在启动，请等待结束后重新读取 UI tree。");
+    const adb = this.adb;
+    const stream = this.configuration?.stream;
+    if (!adb || !this.playing || !stream)
+      throw new Error("请先开始投屏并等待画面，再读取 UI tree。");
+    const session = (this.uiTree ??= UiTreeSession.forAdb(adb));
+    const revision = this.uiInputEpoch;
+    try {
+      const snapshot = await session.capture();
+      if (
+        this.adb !== adb ||
+        !this.playing ||
+        this.configuration?.stream !== stream
+      ) {
+        session.invalidate();
+        throw new Error("读取期间画面已改变，请重新获取 UI tree。");
+      }
+      if (revision !== this.uiInputEpoch || this.uiTree !== session) {
+        session.invalidate();
+        throw new Error(
+          "读取期间发生了其他输入或 helper 已改变，请重新获取 UI tree。",
+        );
+      }
+      return { ...snapshot, stream };
+    } catch (error) {
+      return this.uiTreeFailure(session, error);
+    }
+  }
+
+  async performUiAction(
+    value: LocalUiNodeActionRequest,
+  ): Promise<UiNodeActionResult> {
+    const session = this.uiTree;
+    const input = this.input;
+    const stream = this.configuration?.stream;
+    if (
+      !this.playing ||
+      !input ||
+      !session ||
+      !stream ||
+      value.stream !== stream
+    )
+      throw new Error("节点动作对应的设备或画面已失效，请重新读取 UI tree。");
+    const request = session.validateAction(value);
+    const revision = this.uiInputEpoch;
+    try {
+      if (this.inputController !== LOCAL_CONTROLLER) {
+        this.inputController = LOCAL_CONTROLLER;
+        await input.setController(LOCAL_CONTROLLER);
+      }
+      return await input.execute(LOCAL_CONTROLLER, stream, async () => {
+        if (
+          this.uiTree !== session ||
+          this.input !== input ||
+          revision !== this.uiInputEpoch
+        )
+          throw new Error("节点动作已取消：设备或输入状态已改变，请重新读取。");
+        ++this.uiInputEpoch;
+        const result = await session.performAction(request);
+        if (
+          !this.playing ||
+          this.configuration?.stream !== stream ||
+          this.uiTree !== session
+        )
+          throw new Error("节点动作期间会话已改变，结果未知，请重新读取确认。");
+        return result;
+      });
+    } catch (error) {
+      return this.uiTreeFailure(session, error);
+    }
+  }
+
+  private invalidateUiActions() {
+    ++this.uiInputEpoch;
+    this.uiTree?.invalidate();
+  }
+
+  async launchApp(value: string): Promise<AppLaunchResult> {
+    const packageName = parsePackageName(value);
+    const adb = this.adb;
+    const input = this.input;
+    const stream = this.configuration?.stream;
+    if (!adb || !input || !this.playing || !stream)
+      throw new Error("请先开始投屏并等待画面，再启动应用。");
+    if (this.appLaunchPending) throw new Error("已有应用启动请求正在进行。");
+    this.appLaunchPending = true;
+    try {
+      if (this.inputController !== LOCAL_CONTROLLER) {
+        this.inputController = LOCAL_CONTROLLER;
+        await input.setController(LOCAL_CONTROLLER);
+      }
+      return await input.execute(LOCAL_CONTROLLER, stream, async () => {
+        if (this.adb !== adb || this.input !== input)
+          throw new Error("设备会话已改变，未启动应用。");
+        this.invalidateUiActions();
+        const launcher = (this.appLauncher ??= AppLauncher.forAdb(adb));
+        try {
+          const result = await launcher.launch(packageName);
+          if (this.adb !== adb || this.input !== input || !this.playing)
+            throw new Error(
+              "应用启动期间设备或画面已改变，结果可能未知，请确认当前页面。",
+            );
+          return result;
+        } finally {
+          this.invalidateUiActions();
+        }
+      });
+    } finally {
+      this.appLaunchPending = false;
+    }
+  }
+
+  private async uiTreeFailure(
+    session: UiTreeSession,
+    error: unknown,
+  ): Promise<never> {
+    if (!session.usable) {
+      if (this.uiTree === session) this.uiTree = undefined;
+      try {
+        await session.close();
+      } catch (cleanupError) {
+        throw new Error(
+          `${errorText(error)}\nUI helper 关闭失败：${errorText(cleanupError)}`,
+        );
+      }
+    }
+    throw error;
+  }
+
+  get uiTreeActive() {
+    return !!this.uiTree?.usable;
+  }
+
+  async stopUiTree() {
+    const session = this.uiTree;
+    this.uiTree = undefined;
+    await session?.close();
+  }
+
   async remoteInput(id: string, event: RemoteInput, stream: number) {
     if (!this.playing || !this.input) throw new Error("设备未在投屏。");
+    if (event.kind !== "release") this.invalidateUiActions();
     await this.input.write(id, event, stream);
   }
 
@@ -466,6 +622,8 @@ export class DeviceSession {
   }
 
   async stop(preserveShare = false) {
+    this.appLauncher?.cancel();
+    this.invalidateUiActions();
     this.closing = true;
     ++this.epoch;
     this.playing = false;
@@ -485,8 +643,13 @@ export class DeviceSession {
     const input = this.input;
     this.input = undefined;
     if (!preserveShare) this.onEnded();
+    const failures: string[] = [];
+    const uiCleanup = preserveShare
+      ? Promise.resolve()
+      : this.stopUiTree().catch((error: unknown) => {
+          failures.push(`UI helper 关闭失败：${errorText(error)}`);
+        });
     if (client) {
-      const failures: string[] = [];
       try {
         await input?.setController(null);
       } catch (error) {
@@ -508,14 +671,15 @@ export class DeviceSession {
       } finally {
         audioAbort?.abort();
       }
-      if (failures.length) {
-        const error = new Error(failures.join("\n"));
-        this.onStatus(
-          `视频服务关闭失败：${errorText(error)}；请断开设备后重试。`,
-        );
-        throw error;
-      }
     } else audioAbort?.abort();
+    await uiCleanup;
+    if (failures.length) {
+      const error = new Error(failures.join("\n"));
+      this.onStatus(
+        `视频服务关闭失败：${errorText(error)}；请断开设备后重试。`,
+      );
+      throw error;
+    }
     this.closing = false;
     this.onStatus(
       this.connected ? "本地投屏已停止，可以再次开始。" : "设备未连接。",
@@ -530,6 +694,8 @@ export class DeviceSession {
     this.closing = true;
     const adb = this.adb;
     this.adb = undefined;
+    this.appLauncher?.cancel();
+    this.appLauncher = undefined;
     this.connected = false;
     const cleanupErrors: string[] = [];
     try {

@@ -146,4 +146,84 @@ describe("host-side remote input boundary", () => {
       input.write("local", { kind: "text", text: "still-revoked" }, 7),
     ).rejects.toThrow("授权");
   });
+
+  it("serializes semantic actions with Tango input and releases held touches before executing", async () => {
+    const operation = vi.fn<() => Promise<string>>();
+    await expect(input.execute(id, 7, operation)).rejects.toThrow("授权");
+    await input.setController(id);
+    await expect(input.execute(id, 6, operation)).rejects.toThrow("画面");
+    await input.write(
+      id,
+      { kind: "touch", action: "down", pointerId: 0, x: 0.5, y: 0.5 },
+      7,
+    );
+    let finish!: (value: string) => void;
+    let began!: () => void;
+    const started = new Promise<void>((resolve) => {
+      began = resolve;
+    });
+    operation.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+          began();
+        }),
+    );
+    const action = input.execute(id, 7, operation);
+    await started;
+    expect(
+      writer.injectTouch.mock.calls.map(([event]) => event.action),
+    ).toEqual([0, 1]);
+    const text = input.write(id, { kind: "text", text: "after action" }, 7);
+    expect(writer.setClipboard).not.toHaveBeenCalled();
+    finish("accepted");
+    await expect(action).resolves.toBe("accepted");
+    await text;
+    expect(writer.setClipboard).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a queued semantic action explicitly when control is revoked", async () => {
+    let finish!: () => void;
+    writer.injectKeyCode.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await input.setController(id);
+    const held = input.write(
+      id,
+      { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+      7,
+    );
+    await Promise.resolve();
+    const operation = vi.fn(async () => {});
+    const action = expect(input.execute(id, 7, operation)).rejects.toThrow(
+      "已取消",
+    );
+    const revoked = input.setController(null);
+    finish();
+    await Promise.all([held, action, revoked]);
+    expect(operation).not.toHaveBeenCalled();
+  });
+
+  it("revokes semantic execution and surfaces a held-input release failure", async () => {
+    await input.setController(id);
+    await input.write(
+      id,
+      { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+      7,
+    );
+    writer.injectKeyCode.mockRejectedValueOnce(new Error("release failed"));
+    input.onReleaseError = vi.fn();
+    const operation = vi.fn(async () => {});
+    await expect(input.execute(id, 7, operation)).rejects.toThrow(
+      "release failed",
+    );
+    expect(input.onReleaseError).toHaveBeenCalledOnce();
+    expect(operation).not.toHaveBeenCalled();
+    await expect(
+      input.write(id, { kind: "text", text: "not authorized" }, 7),
+    ).rejects.toThrow("授权");
+  });
 });

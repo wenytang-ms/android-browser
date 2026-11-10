@@ -6,6 +6,8 @@ import { errorText, relayUrl } from "../shared/protocol.js";
 import { login, logout } from "../shared/auth.js";
 import { CanvasInput } from "../shared/input.js";
 import { AudioPlayer } from "../shared/audio-player.js";
+import { UiInspector } from "./ui-inspector.js";
+import { parsePackageName } from "../shared/app-launch.js";
 import type { LocalAudioStatus } from "../shared/audio-player.js";
 import "../shared/style.css";
 
@@ -32,7 +34,12 @@ const canvas = element("screen", HTMLCanvasElement);
 const localControls = element("local-controls", HTMLFieldSetElement);
 const localText = element("local-text", HTMLTextAreaElement);
 const remoteControl = element("remote-control", HTMLInputElement);
+const appControls = element("app-launch-controls", HTMLFieldSetElement);
+const appPackage = element("app-package", HTMLInputElement);
+const appStatus = element("app-launch-status", HTMLParagraphElement);
 let busy = false;
+let launchBusy = false;
+let launchEpoch = 0;
 let shareBusy = false;
 let localStream = 0;
 let localConfigurationStream = 0;
@@ -48,7 +55,12 @@ const audioPlayer = new AudioPlayer((message) => {
 const localInput = new CanvasInput(canvas, (event) => {
   const stream = localStream;
   if (!stream) return;
-  if (event.kind !== "release") share.setRemoteControlEnabled(false);
+  if (event.kind !== "release") {
+    uiInspector.invalidateActions(
+      "已有本地输入，请重新读取 UI tree 后再执行节点动作。",
+    );
+    share.setRemoteControlEnabled(false);
+  }
   void device.localInput(event, stream).catch((error: unknown) => {
     if (!device.playing || stream !== localStream) return;
     const message = `本地输入失败：${errorText(error)}；请重新开始投屏。`;
@@ -75,8 +87,13 @@ const share = new HostShare(
     });
     update();
   },
-  (message, stream) =>
-    device.remoteInput(message.controlId, message.event, stream),
+  (message, stream) => {
+    if (message.event.kind !== "release")
+      uiInspector.invalidateActions(
+        "已有远端输入，请重新读取 UI tree 后再执行节点动作。",
+      );
+    return device.remoteInput(message.controlId, message.event, stream);
+  },
 );
 const player = new VideoPlayer(
   canvas,
@@ -112,6 +129,10 @@ const device = new DeviceSession(
     share.push(packet);
   },
   () => {
+    ++launchEpoch;
+    if (launchBusy)
+      appStatus.textContent =
+        "投屏或设备已结束；正在启动的应用结果可能未知，请确认手机页面。";
     pauseLocalInput();
     player.reset();
     audioPlayer.close();
@@ -129,6 +150,15 @@ const device = new DeviceSession(
     updateAudio();
   },
 );
+const uiInspector = new UiInspector(
+  canvas,
+  () => device.getUiTree(),
+  () => device.stopUiTree(),
+  (request) => {
+    share.setRemoteControlEnabled(false);
+    return device.performUiAction(request);
+  },
+);
 
 function update() {
   buttons.connect.disabled = busy || device.connected;
@@ -142,15 +172,22 @@ function update() {
     : device.screenOff
       ? "已请求息屏：浏览器画面与控制继续。"
       : "未请求息屏／已请求恢复显示。";
-  buttons.share.disabled = shareBusy || busy || !device.playing || share.active;
+  buttons.share.disabled =
+    shareBusy || busy || launchBusy || !device.playing || share.active;
   buttons.unshare.disabled = shareBusy || !share.active;
   relay.disabled = share.active;
   deploymentToken.disabled = share.active;
-  remoteControl.disabled = !share.active || shareBusy;
+  remoteControl.disabled = !share.active || shareBusy || launchBusy;
   remoteControl.checked = share.remoteControlEnabled;
-  const localEnabled = device.playing && !!localStream && !busy;
+  const localEnabled = device.playing && !!localStream && !busy && !launchBusy;
+  appControls.disabled = !localEnabled || shareBusy;
   localControls.disabled = !localEnabled;
   localInput.setEnabled(localEnabled);
+  uiInspector.update(
+    device.playing && !!localStream && !launchBusy,
+    localStream,
+    device.uiTreeActive,
+  );
   element("share-link", HTMLDivElement).hidden = !share.link;
   link.value = share.link;
   element("expiry", HTMLParagraphElement).textContent = share.link
@@ -191,6 +228,7 @@ function pauseLocalInput() {
   localControls.disabled = true;
   localStream = 0;
   localConfigurationStream = 0;
+  uiInspector.update(false, 0, device.uiTreeActive);
 }
 
 function stopForInputError(message: string) {
@@ -306,6 +344,38 @@ element("local-send-text", HTMLButtonElement).onclick = () => {
     deviceStatus.textContent = `文本发送失败：${errorText(error)}`;
   }
 };
+element("app-launch-form", HTMLFormElement).onsubmit = (event) => {
+  event.preventDefault();
+  if (launchBusy) return;
+  let packageName: string;
+  try {
+    packageName = parsePackageName(appPackage.value.trim());
+  } catch (error) {
+    appStatus.textContent = `应用未启动：${errorText(error)}`;
+    return;
+  }
+  const epoch = ++launchEpoch;
+  launchBusy = true;
+  update();
+  share.setRemoteControlEnabled(false);
+  appStatus.textContent = `正在启动 ${packageName}…`;
+  void device
+    .launchApp(packageName)
+    .then(
+      (result) => {
+        if (epoch === launchEpoch)
+          appStatus.textContent = `Android 已接受 ${result.packageName} 的启动请求。请重新读取 UI tree 确认当前页面；不自动跳过广告。`;
+      },
+      (error: unknown) => {
+        if (epoch === launchEpoch)
+          appStatus.textContent = `应用启动失败：${errorText(error)}。不会自动重试。`;
+      },
+    )
+    .finally(() => {
+      launchBusy = false;
+      update();
+    });
+};
 element("copy", HTMLButtonElement).onclick = () => {
   void navigator.clipboard.writeText(share.link).then(
     () => {
@@ -339,6 +409,7 @@ window.addEventListener(
     share.dispose();
     player.dispose();
     audioPlayer.dispose();
+    uiInspector.dispose();
     device.dispose();
   },
   { once: true },

@@ -1,0 +1,68 @@
+import type { UiNode, UiTreeSnapshot } from "../src/shared/ui-tree.js";
+
+export function uiTreeFixture(id = 1): UiTreeSnapshot {
+  const node: UiNode = {
+    id: 0,
+    parentId: null,
+    windowId: 1,
+    resourceId: "",
+    className: "android.widget.FrameLayout",
+    packageName: "example.fixture",
+    text: "",
+    description: "",
+    bounds: [0, 0, 64, 64],
+    clickable: false,
+    enabled: true,
+    visible: true,
+    scrollable: false,
+    editable: false,
+    focused: false,
+    checkable: false,
+    checked: false,
+    password: false,
+    actions: [
+      "scrollForward",
+      "scrollBackward",
+      "scrollUp",
+      "scrollDown",
+      "scrollLeft",
+      "scrollRight",
+    ],
+  };
+  return {
+    snapshotId: id,
+    snapshotRef: `00000000-0000-4000-8000-${id.toString(16).padStart(12, "0")}`,
+    expiresInMs: 30_000,
+    capturedAtMs: 1000,
+    durationMs: 12,
+    display: { id: 0, width: 64, height: 64, rotation: 0 },
+    truncated: false,
+    nodes: [
+      node,
+      {
+        ...node,
+        id: 1,
+        parentId: 0,
+        className: "android.widget.Button",
+        resourceId: "example.fixture:id/settings",
+        text: "Settings <b>safe</b>",
+        description: "\u8bbe\u7f6e",
+        clickable: true,
+        actions: ["click", "longClick"],
+        bounds: [8, 8, 40, 32],
+      },
+      {
+        ...node,
+        id: 2,
+        parentId: 0,
+        resourceId: "example.fixture:id/password",
+        editable: true,
+        actions: ["setText"],
+        password: true,
+        text: "fixture-password",
+        description: "fixture-password",
+        bounds: [8, 36, 56, 56],
+      },
+    ],
+  };
+}

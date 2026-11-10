@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, for example 0.0.3-alpha (without v)"
+        description: "Release version, for example 0.0.4-alpha (without v)"
         required: true
-        default: "0.0.3-alpha"
+        default: "0.0.4-alpha"
         type: string
 
 permissions:
@@ -34,6 +34,12 @@ jobs:
 
       - name: Install locked dependencies
         run: npm ci --no-audit --no-fund
+
+      - name: Set up Java for the UI helper
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
 
       - name: Check source formatting
         run: npm run format:check
@@ -94,12 +100,33 @@ jobs:
           In desktop Chrome 118+, open `chrome://extensions`, enable Developer mode,
           choose **Load unpacked**, and select the extracted folder containing `manifest.json`.
 
-          This package includes Tango, the WebCodecs player, scrcpy-server 2.1 and third-party notices.
+          This package includes Tango, the WebCodecs player, scrcpy-server 2.1,
+          the no-APK Android UI helper and third-party notices.
           It supports local/remote touch, drag, keyboard and text input, local-priority takeover,
           and host controls to turn off the phone's physical screen while mirroring continues.
           Local USB mirroring and control do not require Google sign-in or a relay.
 
-          ## New in 0.0.3-alpha: local media audio
+          ## New in 0.0.4-alpha: on-demand UI automation and app launch
+
+          On Android 7+ with ADB shell v2, read the current active-window UI tree only when
+          requested. The bundled resident UiAutomation helper does not install an APK,
+          require an AccessibilityService, open a phone port or continuously refresh the tree.
+          Inspect/filter nodes and highlight their bounds on the mirrored screen.
+
+          Execute supported node click, long-click, set/clear text and scroll actions.
+          Node references are one-shot and expire after at most 30 seconds; reread the tree
+          after any action, input or screen change. Arbitrary coordinate input still uses Tango.
+
+          Launch an installed app by package name using its current-user MAIN/LAUNCHER entry,
+          without starting the UI helper. App launch and node actions follow local-priority
+          takeover and invalidate old node references. Android acceptance does not prove a
+          business task completed: reread the UI tree to confirm. Timeout/interruption outcomes
+          can be unknown; no automatic retry, coordinate fallback or ad-skipping is performed.
+
+          UI automation and app launch are local-only. This release does not expose an
+          external-agent interface, remote UI tree/actions, arbitrary Shell, an HTTP bridge or MCP.
+
+          ## Local media audio (from 0.0.3-alpha)
 
           On Android 11+, phone media audio can play in the host's local webpage instead of
           the phone speaker or headset. Calls, notifications and alarms remain unchanged.
@@ -117,8 +144,8 @@ jobs:
           See the repository README for setup, USB driver compatibility and deployment instructions.
 
           Preliminary local video testing of the first release is recorded in issue #1.
-          The newer input, physical-screen-off and local-audio features still require real-device verification;
-          cross-network acceptance testing is also pending.
+          The new UI helper, semantic actions and app launch still require Android/OEM
+          real-device verification. Audio routing and cross-network acceptance testing also remain pending.
           NOTES
           args=(
             release create "$RELEASE_TAG"

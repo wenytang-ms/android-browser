@@ -4,6 +4,7 @@ coverage/
 .env
 *.log
 extension/public/scrcpy-server.jar
+extension/public/ui-helper.jar
 extension/public/scrcpy-license.txt
 extension/public/third-party-notices.txt
 viewer/public/third-party-notices.txt
