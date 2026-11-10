@@ -12,16 +12,45 @@ export type Role = "host" | "viewer";
 export type Channel = "control" | "media";
 export type SessionState = "online" | "host-offline" | "waiting-video";
 
+export type RemoteInput =
+  | {
+      kind: "touch";
+      action: "down" | "move" | "up";
+      pointerId: number;
+      x: number;
+      y: number;
+    }
+  | {
+      kind: "key";
+      action: "down" | "up";
+      keyCode: AndroidKeyCode;
+      metaState: AndroidKeyEventMeta;
+    }
+  | { kind: "text"; text: string }
+  | { kind: "release" };
+
+export interface InputMessage {
+  v: 1;
+  type: "input";
+  controlId: string;
+  stream: number;
+  sequence: number;
+  event: RemoteInput;
+}
+
 export type ClientMessage =
-  | { v: 1; type: "create"; deploymentToken: string }
+  | { v: 1; type: "create"; deploymentToken: string; accountToken: string }
   | {
       v: 1;
       type: "auth";
       role: Role;
       session: string;
-      token: string;
+      accountToken: string;
+      token?: string;
       viewerId?: string;
     }
+  | InputMessage
+  | { v: 1; type: "control-permission"; enabled: boolean }
   | { v: 1; type: "ping" }
   | { v: 1; type: "end" }
   | { v: 1; type: "resync" };
@@ -32,12 +61,14 @@ export type ServerMessage =
       type: "created";
       session: string;
       hostToken: string;
-      viewerToken: string;
       expiresAt: number;
     }
   | { v: 1; type: "ready"; expiresAt: number }
   | { v: 1; type: "state"; state: SessionState }
   | { v: 1; type: "resync" }
+  | { v: 1; type: "controller"; controlId: string | null }
+  | { v: 1; type: "control-permission"; enabled: boolean }
+  | InputMessage
   | { v: 1; type: "pong" }
   | { v: 1; type: "ended"; reason: string }
   | { v: 1; type: "error"; code: string; message: string };
@@ -62,6 +93,107 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function credential(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function integer(value: unknown, min: number, max: number): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= min &&
+    value <= max
+  );
+}
+
+function allowedKey(value: unknown): value is AndroidKeyCode {
+  return (
+    integer(value, 0, 255) &&
+    ([3, 4, 24, 25, 26, 82, 92, 93, 111, 112, 122, 123, 124, 187].includes(
+      value,
+    ) ||
+      (value >= 7 && value <= 16) ||
+      (value >= 19 && value <= 23) ||
+      (value >= 29 && value <= 62) ||
+      (value >= 66 && value <= 76))
+  );
+}
+
+function allowedMeta(value: unknown): value is AndroidKeyEventMeta {
+  return integer(value, 0, 0x11003) && (value & ~0x11003) === 0;
+}
+
+export function parseRemoteInput(value: unknown): RemoteInput {
+  if (!record(value)) throw new Error("Invalid input event.");
+  switch (value.kind) {
+    case "touch":
+      if (
+        (value.action === "down" ||
+          value.action === "move" ||
+          value.action === "up") &&
+        integer(value.pointerId, 0, 9) &&
+        typeof value.x === "number" &&
+        Number.isFinite(value.x) &&
+        value.x >= 0 &&
+        value.x <= 1 &&
+        typeof value.y === "number" &&
+        Number.isFinite(value.y) &&
+        value.y >= 0 &&
+        value.y <= 1
+      )
+        return {
+          kind: "touch",
+          action: value.action,
+          pointerId: value.pointerId,
+          x: value.x,
+          y: value.y,
+        };
+      break;
+    case "key":
+      if (
+        (value.action === "down" || value.action === "up") &&
+        allowedKey(value.keyCode) &&
+        allowedMeta(value.metaState)
+      )
+        return {
+          kind: "key",
+          action: value.action,
+          keyCode: value.keyCode,
+          metaState: value.metaState,
+        };
+      break;
+    case "text":
+      if (
+        typeof value.text === "string" &&
+        value.text.length > 0 &&
+        new TextEncoder().encode(value.text).byteLength <= 1024 &&
+        !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value.text)
+      )
+        return { kind: "text", text: value.text };
+      break;
+    case "release":
+      return { kind: "release" };
+  }
+  throw new Error("Input is outside the touch/key/text allowlist.");
+}
+
+function parseInputMessage(value: Record<string, unknown>): InputMessage {
+  if (
+    !isSessionId(value.controlId) ||
+    !integer(value.stream, 1, 0xffffffff) ||
+    !integer(value.sequence, 1, 0xffffffff)
+  )
+    throw new Error("Invalid input generation or sequence.");
+  return {
+    v: 1,
+    type: "input",
+    controlId: value.controlId,
+    stream: value.stream,
+    sequence: value.sequence,
+    event: parseRemoteInput(value.event),
+  };
+}
+
 export function parseClientMessage(text: string): ClientMessage {
   const value: unknown = JSON.parse(text);
   if (!record(value) || value.v !== VERSION)
@@ -70,16 +202,22 @@ export function parseClientMessage(text: string): ClientMessage {
     case "create":
       if (
         typeof value.deploymentToken === "string" &&
-        value.deploymentToken.length <= 256
+        value.deploymentToken.length <= 256 &&
+        credential(value.accountToken)
       )
-        return { v: 1, type: "create", deploymentToken: value.deploymentToken };
+        return {
+          v: 1,
+          type: "create",
+          deploymentToken: value.deploymentToken,
+          accountToken: value.accountToken,
+        };
       break;
     case "auth":
       if (
         (value.role === "host" || value.role === "viewer") &&
         isSessionId(value.session) &&
-        typeof value.token === "string" &&
-        /^[a-f0-9]{64}$/.test(value.token) &&
+        credential(value.accountToken) &&
+        (value.role === "viewer" || credential(value.token)) &&
         (value.role === "host" || isSessionId(value.viewerId))
       )
         return {
@@ -87,10 +225,17 @@ export function parseClientMessage(text: string): ClientMessage {
           type: "auth",
           role: value.role,
           session: value.session,
-          token: value.token,
+          accountToken: value.accountToken,
+          token: credential(value.token) ? value.token : undefined,
           viewerId:
             typeof value.viewerId === "string" ? value.viewerId : undefined,
         };
+      break;
+    case "input":
+      return parseInputMessage(value);
+    case "control-permission":
+      if (typeof value.enabled === "boolean")
+        return { v: 1, type: "control-permission", enabled: value.enabled };
       break;
     case "ping":
     case "end":
@@ -110,8 +255,6 @@ export function parseServerMessage(text: string): ServerMessage {
         isSessionId(value.session) &&
         typeof value.hostToken === "string" &&
         /^[a-f0-9]{64}$/.test(value.hostToken) &&
-        typeof value.viewerToken === "string" &&
-        /^[a-f0-9]{64}$/.test(value.viewerToken) &&
         typeof value.expiresAt === "number"
       )
         return {
@@ -119,9 +262,18 @@ export function parseServerMessage(text: string): ServerMessage {
           type: "created",
           session: value.session,
           hostToken: value.hostToken,
-          viewerToken: value.viewerToken,
           expiresAt: value.expiresAt,
         };
+      break;
+    case "input":
+      return parseInputMessage(value);
+    case "control-permission":
+      if (typeof value.enabled === "boolean")
+        return { v: 1, type: "control-permission", enabled: value.enabled };
+      break;
+    case "controller":
+      if (value.controlId === null || isSessionId(value.controlId))
+        return { v: 1, type: "controller", controlId: value.controlId };
       break;
     case "ready":
       if (typeof value.expiresAt === "number")
@@ -238,3 +390,4 @@ export function channelUrl(base: URL, channel: Channel): string {
 export function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+import type { AndroidKeyCode, AndroidKeyEventMeta } from "@yume-chan/scrcpy";

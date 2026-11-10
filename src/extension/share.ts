@@ -1,4 +1,5 @@
 import { ChannelConnection } from "../shared/connection.js";
+import { logout } from "../shared/auth.js";
 import {
   encodeMedia,
   errorText,
@@ -6,10 +7,15 @@ import {
   MAX_BUFFER_BYTES,
   MAX_PACKET_BYTES,
 } from "../shared/protocol.js";
-import type { MediaPacket, ServerMessage } from "../shared/protocol.js";
+import type {
+  InputMessage,
+  MediaPacket,
+  ServerMessage,
+} from "../shared/protocol.js";
 
 export class HostShare {
   active = false;
+  remoteControlEnabled = false;
   link = "";
   expiresAt = 0;
   bufferedBytes = 0;
@@ -18,7 +24,9 @@ export class HostShare {
   private media?: ChannelConnection;
   private session = "";
   private hostToken = "";
-  private viewerToken = "";
+  private accountToken = "";
+  private controlId: string | null = null;
+  private inputSequence = 0;
   private configuration?: MediaPacket;
   private stream = 0;
   private sequence = 0;
@@ -35,16 +43,28 @@ export class HostShare {
     private readonly onStatus: (message: string) => void,
     private readonly onChanged: () => void,
     private readonly onRestartVideo: () => void,
+    private readonly onController: (id: string | null) => void,
+    private readonly onInput: (
+      message: InputMessage,
+      localStream: number,
+    ) => Promise<void>,
   ) {}
 
-  async start(base: URL, deploymentToken: string, configuration?: MediaPacket) {
+  async start(
+    base: URL,
+    deploymentToken: string,
+    accountToken: string,
+    configuration?: MediaPacket,
+  ) {
     if (this.active) throw new Error("分享已经开启。");
     this.active = true;
+    this.remoteControlEnabled = true;
     this.base = base;
     this.configuration = configuration;
     this.stream = 0;
     this.session = "";
     this.hostToken = "";
+    this.accountToken = accountToken;
     this.link = "";
     this.needsSync = true;
     const started = new Promise<void>((resolve, reject) => {
@@ -66,15 +86,29 @@ export class HostShare {
               role: "host",
               session: this.session,
               token: this.hostToken,
+              accountToken: this.accountToken,
             }
-          : { v: 1, type: "create", deploymentToken },
+          : {
+              v: 1,
+              type: "create",
+              deploymentToken,
+              accountToken: this.accountToken,
+            },
       (message) => this.message(message),
       this.onStatus,
-      () => this.openMedia(),
+      () => {
+        this.control?.send({
+          v: 1,
+          type: "control-permission",
+          enabled: this.remoteControlEnabled,
+        });
+        this.openMedia();
+      },
       undefined,
       () => {
         this.media?.stop();
         this.needsSync = true;
+        this.setController(null);
       },
       (message) => this.finish(message),
     );
@@ -87,8 +121,40 @@ export class HostShare {
     if (message.type === "created") {
       this.session = message.session;
       this.hostToken = message.hostToken;
-      this.viewerToken = message.viewerToken;
       this.expiresAt = message.expiresAt;
+    } else if (message.type === "controller") {
+      this.setController(this.remoteControlEnabled ? message.controlId : null);
+    } else if (message.type === "input") {
+      if (
+        !this.remoteControlEnabled ||
+        !this.controlId ||
+        message.controlId !== this.controlId
+      )
+        return;
+      if (
+        !this.active ||
+        !this.control?.ready ||
+        this.needsSync ||
+        !this.configuration ||
+        message.stream !== this.stream ||
+        message.sequence !== this.inputSequence + 1
+      ) {
+        this.finish("远程输入授权或画面序列异常，共享已停止。");
+        return;
+      }
+      this.inputSequence = message.sequence;
+      void this.onInput(message, this.configuration.stream).catch(
+        (error: unknown) => {
+          if (
+            this.active &&
+            this.remoteControlEnabled &&
+            this.controlId === message.controlId
+          )
+            this.finish(
+              `远程输入失败：${errorText(error)}；本地投屏不受影响。`,
+            );
+        },
+      );
     } else if (message.type === "resync") {
       this.needsSync = true;
       this.waitForKeyframe();
@@ -100,6 +166,25 @@ export class HostShare {
           : `分享已结束：${message.reason}`,
       );
     }
+  }
+
+  private setController(id: string | null) {
+    this.controlId = id;
+    this.inputSequence = 0;
+    this.onController(id);
+  }
+
+  setRemoteControlEnabled(enabled: boolean) {
+    if (!this.active || this.remoteControlEnabled === enabled) return;
+    this.remoteControlEnabled = enabled;
+    this.setController(null);
+    this.control?.send({ v: 1, type: "control-permission", enabled });
+    this.onStatus(
+      enabled
+        ? "已允许同账号远端控制，等待新画面；本地操作会再次接管。"
+        : "本地已接管；远端仅观看。可勾选“允许远端控制”恢复。",
+    );
+    this.onChanged();
   }
 
   private openMedia() {
@@ -114,6 +199,7 @@ export class HostShare {
         role: "host",
         session: this.session,
         token: this.hostToken,
+        accountToken: this.accountToken,
       }),
       (message) => this.message(message),
       this.onStatus,
@@ -122,9 +208,12 @@ export class HostShare {
         this.waitForKeyframe();
         const link = new URL("/", this.base);
         link.searchParams.set("session", this.session);
-        link.hash = `token=${this.viewerToken}`;
         this.link = link.href;
-        this.onStatus("远程分享已开启，等待观看者；链接凭据有效 30 分钟。");
+        this.onStatus(
+          this.remoteControlEnabled
+            ? "远程共享已开启：仅同一 Google 账号可观看和控制，有效 30 分钟。"
+            : "远程共享已开启：同账号只读观看；本地已接管，有效 30 分钟。",
+        );
         this.resolveStart?.();
         this.resolveStart = undefined;
         this.rejectStart = undefined;
@@ -145,6 +234,7 @@ export class HostShare {
     if (packet.kind === "configuration") {
       this.configuration = { ...packet, data: new Uint8Array(packet.data) };
       this.needsSync = true;
+      if (this.controlId) this.onController(this.controlId);
       return;
     }
     const socket = this.media?.socket;
@@ -244,6 +334,8 @@ export class HostShare {
   private finish(message: string) {
     if (!this.active) return;
     this.active = false;
+    this.remoteControlEnabled = false;
+    this.setController(null);
     this.control?.send({ v: 1, type: "end" });
     this.control?.stop();
     this.media?.stop();
@@ -262,7 +354,12 @@ export class HostShare {
     this.resolveEnd = undefined;
     this.session = "";
     this.hostToken = "";
-    this.viewerToken = "";
+    const accountToken = this.accountToken;
+    this.accountToken = "";
+    if (accountToken && this.base)
+      void logout(this.base, accountToken).catch((error: unknown) =>
+        this.onStatus(`${message}\n${errorText(error)}`),
+      );
     this.link = "";
     this.configuration = undefined;
     this.bufferedBytes = 0;

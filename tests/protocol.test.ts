@@ -5,6 +5,7 @@ import {
   MAX_PACKET_BYTES,
   parseClientMessage,
   parseServerMessage,
+  parseRemoteInput,
   relayUrl,
 } from "../src/shared/protocol.js";
 import type { MediaPacket } from "../src/shared/protocol.js";
@@ -71,5 +72,21 @@ describe("versioned media protocol", () => {
       "https://share.example.com/?token=x",
     ])
       expect(() => relayUrl(url)).toThrow();
+  });
+
+  it("allows only bounded touch/key/text events and rejects shell commands and invalid input parameters", () => {
+    for (const event of [
+      { kind: "shell", command: "not-an-input-operation" },
+      { kind: "touch", action: "down", pointerId: 0, x: 1.1, y: 0 },
+      { kind: "touch", action: "down", pointerId: 10, x: 0, y: 0 },
+      { kind: "key", action: "down", keyCode: 101, metaState: 0 },
+      { kind: "key", action: "down", keyCode: 66, metaState: 4 },
+      { kind: "text", text: "a".repeat(1025) },
+    ])
+      expect(() => parseRemoteInput(event)).toThrow();
+    expect(parseRemoteInput({ kind: "text", text: "literal text" })).toEqual({
+      kind: "text",
+      text: "literal text",
+    });
   });
 });

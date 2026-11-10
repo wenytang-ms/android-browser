@@ -95,6 +95,7 @@ export class ChannelConnection {
               expired: "分享已过期。",
               "host-offline": "宿主离线，分享会话已结束。",
               "relay-shutdown": "中继关闭，分享会话已结束。",
+              "login-expired": "Google 登录已注销或过期，请重新登录。",
             }[message.reason] ?? `会话已结束：${message.reason}`,
           );
           return;

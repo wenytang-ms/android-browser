@@ -63,6 +63,7 @@ export class VideoPlayer {
     private readonly canvas: HTMLCanvasElement,
     private readonly onError: (message: string) => void,
     private readonly onResync: () => void = () => {},
+    private readonly onRendered: (stream: number) => void = () => {},
   ) {
     const context = canvas.getContext("2d", { alpha: false });
     if (!context) throw new Error("无法创建 Canvas 播放画布。");
@@ -132,7 +133,10 @@ export class VideoPlayer {
         );
       this.decoderConfig = config;
       this.decoder = new VideoDecoder({
-        output: (frame) => this.output(frame),
+        output: (frame) => {
+          if (epoch !== this.epoch) frame.close();
+          else this.output(frame);
+        },
         error: (error) => this.fail(`H.264 解码异常：${error.message}`),
       });
       this.decoder.addEventListener("dequeue", () => {
@@ -182,6 +186,7 @@ export class VideoPlayer {
         this.stats.height = latest.displayHeight;
         this.context.drawImage(latest, 0, 0);
         this.stats.rendered++;
+        this.onRendered(this.stream);
       } catch (error) {
         this.fail(`画面显示失败：${errorText(error)}`);
       } finally {

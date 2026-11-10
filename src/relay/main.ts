@@ -3,6 +3,12 @@ import { createRelay } from "./server.js";
 import { relayUrl } from "../shared/protocol.js";
 
 const publicUrl = relayUrl(process.env.PUBLIC_URL ?? "http://localhost:3000");
+const clientId = process.env.GOOGLE_CLIENT_ID;
+const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+if (!clientId || !clientSecret)
+  throw new Error(
+    "Remote sharing requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.",
+  );
 if (publicUrl.protocol === "https:" && !process.env.DEPLOYMENT_TOKEN)
   throw new Error("Public deployment requires DEPLOYMENT_TOKEN.");
 const port = Number(process.env.PORT ?? 3000);
@@ -17,6 +23,7 @@ const relay = createRelay({
     .map((origin) => origin.trim())
     .filter(Boolean),
   deploymentToken: process.env.DEPLOYMENT_TOKEN,
+  google: { clientId, clientSecret },
 });
 relay.server.on("error", (error) => {
   console.error("Relay failed:", error.message);

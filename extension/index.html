@@ -8,18 +8,33 @@
   <body>
     <main>
       <h1>Tango Android Share</h1>
-      <p>USB 本地投屏 · 加密远程只读观看</p>
+      <p>USB 本地投屏 · 同 Google 账号远程观看与控制</p>
       <div class="layout">
         <section>
           <div class="panel screen">
             <canvas
               id="screen"
+              tabindex="0"
               width="720"
               height="1280"
               aria-label="Android 实时画面"
             ></canvas>
           </div>
           <p id="stats" class="stats" aria-live="off">等待视频</p>
+          <fieldset id="local-controls" class="panel" disabled>
+            <legend>本地手机控制（无需登录）</legend>
+            <button id="local-back">返回</button>
+            <button id="local-home">主页</button>
+            <button id="local-apps">最近应用</button>
+            <label
+              >文本输入（最多 1024 UTF-8 字节；粘贴会覆盖手机剪贴板）
+              <textarea id="local-text" rows="3" maxlength="1024"></textarea>
+            </label>
+            <button id="local-send-text">发送文本</button>
+            <p class="hint">
+              点击画面使用键盘；拖动或单指触摸可滑动。本地操作会自动接管，远端变为只读。
+            </p>
+          </fieldset>
         </section>
         <aside>
           <section class="panel">
@@ -32,6 +47,15 @@
             <button id="start" disabled>开始投屏</button>
             <button id="stop" disabled>停止投屏</button>
             <button id="disconnect" disabled>断开设备</button>
+            <button id="screen-off" disabled>手机息屏（继续投屏）</button>
+            <button id="screen-on" disabled>恢复手机屏幕显示</button>
+            <p id="screen-status" class="hint" role="status">
+              开始投屏后可关闭手机实体屏幕。
+            </p>
+            <p class="hint">
+              投屏期间 USB 充电时保持系统唤醒。息屏不等于按电源键锁屏；
+              已锁屏的手机仍需正常解锁。停止投屏会请求恢复显示。
+            </p>
             <p id="device-status" class="status" role="status">设备未连接。</p>
           </section>
           <section class="panel">
@@ -53,16 +77,26 @@
                 maxlength="256"
               />
             </label>
-            <button id="share" class="primary" disabled>开启远程分享</button>
+            <button id="share" class="primary" disabled>
+              Google 登录并开启共享
+            </button>
             <button id="unshare" disabled>停止并撤销分享</button>
+            <label class="toggle">
+              <input id="remote-control" type="checkbox" disabled />
+              允许远端控制（本地操作会自动取消）
+            </label>
             <div id="share-link" hidden>
-              <label>观看链接（含访问凭据）<input id="link" readonly /></label>
+              <label
+                >本人访问链接（需登录同账号）<input id="link" readonly
+              /></label>
               <button id="copy">复制链接</button>
               <p id="expiry" class="hint"></p>
             </div>
             <p id="share-status" class="status" role="status">分享未开启。</p>
             <p class="hint">
-              只发给获准观看的人。停止分享不影响本地画面；设备断开会结束分享。保持此标签页、Chrome
+              开启共享即允许同 Google 账号远端观看、触控及键盘输入，不开放 Shell
+              或文件访问。
+              停止共享不影响本地画面；设备断开会结束共享。保持此标签页、Chrome
               和电脑在线。
             </p>
           </section>

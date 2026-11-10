@@ -4,30 +4,46 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="referrer" content="no-referrer" />
-    <title>Tango Android Share · 远端观看</title>
+    <title>Tango Android Share · 本人远程控制</title>
   </head>
   <body>
     <main>
-      <h1>Android 远程观看</h1>
-      <p>画面来自宿主电脑的 USB 手机；此页面不访问 USB，也不提供设备控制。</p>
+      <h1>Android 本人远程控制</h1>
+      <p>
+        仅创建共享的同一 Google
+        账号可以观看；宿主允许时可控制，本地操作会接管并使远端只读。
+      </p>
       <section class="panel">
-        <button id="join" class="primary">授权并观看</button>
-        <button id="leave" disabled>结束观看</button>
+        <button id="join" class="primary">Google 登录并连接</button>
+        <button id="leave" disabled>断开并注销</button>
         <p id="status" class="status" role="status">等待授权。</p>
         <p id="expiry" class="hint"></p>
       </section>
       <div class="panel screen">
         <canvas
           id="screen"
+          tabindex="0"
           width="720"
           height="1280"
           aria-label="远程 Android 实时画面"
         ></canvas>
       </div>
       <p id="stats" class="stats">等待视频</p>
+      <fieldset id="controls" class="panel" disabled>
+        <legend>手机控制</legend>
+        <button id="back">返回</button>
+        <button id="home">主页</button>
+        <button id="apps">最近应用</button>
+        <label
+          >文本输入（最多 1024 UTF-8 字节；粘贴会覆盖手机剪贴板）
+          <textarea id="input-text" rows="3" maxlength="1024"></textarea>
+        </label>
+        <button id="send-text">发送文本</button>
+      </fieldset>
       <p class="hint">
         需要支持 H.264 WebCodecs
-        的浏览器。若分享已撤销或过期，请使用宿主提供的新链接。不要转发含凭据的分享链接。
+        的浏览器。点击画面输入按键，鼠标拖动或单指触摸可滑动；中文请使用文本输入框。
+        不提供 Shell、文件访问或原始 ADB。若共享已撤销或过期，请使用新链接。
       </p>
     </main>
     <script type="module" src="../src/viewer/main.ts"></script>

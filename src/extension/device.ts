@@ -7,6 +7,7 @@ import {
   AdbScrcpyOptions2_1,
 } from "@yume-chan/adb-scrcpy";
 import {
+  AndroidScreenPowerMode,
   ScrcpyCodecOptions,
   DefaultServerPath,
   h264ParseConfiguration,
@@ -15,7 +16,8 @@ import {
 import { ReadableStream, WritableStream } from "@yume-chan/stream-extra";
 import { checkDecoderSupport } from "../shared/player.js";
 import { errorText } from "../shared/protocol.js";
-import type { MediaPacket } from "../shared/protocol.js";
+import type { MediaPacket, RemoteInput } from "../shared/protocol.js";
+import { DeviceInputController } from "./input.js";
 
 export const VIDEO_SETTINGS = {
   maxSize: 1280,
@@ -23,10 +25,15 @@ export const VIDEO_SETTINGS = {
   videoBitRate: 4_000_000,
 };
 const LOCAL_SESSION = "00000000000000000000000000000000";
+const LOCAL_CONTROLLER = "local";
+type DeviceClient = AdbScrcpyClient<AdbScrcpyOptions2_1<true>>;
 
 export class DeviceSession {
   private adb?: Adb;
-  private client?: AdbScrcpyClient<AdbScrcpyOptions2_1<true>>;
+  private client?: DeviceClient;
+  private restoreDisplay = false;
+  private input?: DeviceInputController;
+  private inputController = LOCAL_CONTROLLER;
   private operation = false;
   private epoch = 0;
   private stream = 0;
@@ -40,6 +47,7 @@ export class DeviceSession {
   configuration?: MediaPacket;
   connected = false;
   playing = false;
+  screenOff = false;
 
   constructor(
     private readonly onStatus: (message: string) => void,
@@ -170,7 +178,10 @@ export class DeviceSession {
           ...VIDEO_SETTINGS,
           video: true,
           audio: false,
-          control: false,
+          control: true,
+          stayAwake: true,
+          cleanup: true,
+          clipboardAutosync: false,
           videoCodec: "h264",
           videoCodecOptions: new ScrcpyCodecOptions({
             iFrameInterval: 1,
@@ -188,6 +199,22 @@ export class DeviceSession {
         return;
       }
       this.client = client;
+      if (!client.controller) throw new Error("设备没有提供 scrcpy 控制通道。");
+      const input = new DeviceInputController(client.controller, () =>
+        this.playing ? this.configuration : undefined,
+      );
+      this.input = input;
+      this.inputController = LOCAL_CONTROLLER;
+      await input.setController(LOCAL_CONTROLLER);
+      input.onReleaseError = (error) => {
+        if (this.input !== input) return;
+        const message = `设备按键释放失败：${errorText(error)}，投屏已停止，请重新开始。`;
+        void this.stop().then(
+          () => this.onStatus(message),
+          (closeError: unknown) =>
+            this.onStatus(`${message}\n${errorText(closeError)}`),
+        );
+      };
       void client.output
         .pipeTo(
           new WritableStream<string>({
@@ -207,6 +234,10 @@ export class DeviceSession {
       }
       if (video.metadata.codec !== ScrcpyVideoCodecId.H264)
         throw new Error("设备没有返回 H.264 视频。");
+      if (this.screenOff) {
+        await this.writeScreenPower(client, true);
+        if (epoch !== this.epoch) return;
+      }
       this.playing = true;
       this.onStatus(
         `本地投屏中：${video.metadata.deviceName ?? "Android"}；1280 / 30 fps / 4 Mbps。`,
@@ -229,6 +260,7 @@ export class DeviceSession {
                   height: info.croppedHeight,
                   data: new Uint8Array(packet.data),
                 };
+                void this.releaseInputs().catch(input.onReleaseError);
                 this.onPacket(this.configuration);
               } else {
                 if (!this.configuration || packet.pts === undefined)
@@ -278,6 +310,62 @@ export class DeviceSession {
     await this.start();
   }
 
+  async setRemoteController(id: string | null) {
+    if (id && (!this.playing || !this.input))
+      throw new Error("设备控制通道不可用。");
+    if (!id && this.inputController === LOCAL_CONTROLLER) return;
+    this.inputController = id ?? LOCAL_CONTROLLER;
+    await this.input?.setController(this.inputController);
+  }
+
+  async localInput(event: RemoteInput, stream: number) {
+    const input = this.input;
+    if (!this.playing || !input) throw new Error("设备未在投屏。");
+    if (event.kind === "release" && this.inputController !== LOCAL_CONTROLLER)
+      return;
+    let release: Promise<void> | undefined;
+    if (this.inputController !== LOCAL_CONTROLLER) {
+      this.inputController = LOCAL_CONTROLLER;
+      release = input.setController(LOCAL_CONTROLLER);
+    }
+    const write = input.write(LOCAL_CONTROLLER, event, stream);
+    await Promise.all([release, write]);
+  }
+
+  async releaseInputs() {
+    await this.input?.setController(this.inputController);
+  }
+
+  async remoteInput(id: string, event: RemoteInput, stream: number) {
+    if (!this.playing || !this.input) throw new Error("设备未在投屏。");
+    await this.input.write(id, event, stream);
+  }
+
+  async setScreenOff(off: boolean) {
+    const client = this.client;
+    if (!this.playing || !client)
+      throw new Error("请先开始投屏，再切换手机屏幕显示。");
+    await this.writeScreenPower(client, off);
+    if (this.client !== client) return;
+    this.onStatus(
+      off
+        ? "已发送手机息屏请求；投屏和已授权的浏览器控制继续。"
+        : "已发送恢复手机屏幕显示请求；不会绕过手机锁屏。",
+    );
+  }
+
+  private async writeScreenPower(client: DeviceClient, off: boolean) {
+    if (!client.controller) throw new Error("设备没有提供屏幕控制通道。");
+    // A failed/pending OFF write may still reach Android; restore before teardown.
+    if (off) this.restoreDisplay = true;
+    await client.controller.setScreenPowerMode(
+      off ? AndroidScreenPowerMode.Off : AndroidScreenPowerMode.Normal,
+    );
+    if (this.client !== client) return;
+    this.screenOff = off;
+    this.restoreDisplay = off;
+  }
+
   async stop(preserveShare = false) {
     this.closing = true;
     ++this.epoch;
@@ -285,11 +373,35 @@ export class DeviceSession {
     this.configuration = undefined;
     const client = this.client;
     this.client = undefined;
+    const restoreDisplay = this.restoreDisplay;
+    this.restoreDisplay = false;
+    if (!preserveShare) this.screenOff = false;
+    const input = this.input;
+    this.input = undefined;
     if (!preserveShare) this.onEnded();
     if (client) {
+      const failures: string[] = [];
+      try {
+        await input?.setController(null);
+      } catch (error) {
+        failures.push(`输入释放失败：${errorText(error)}`);
+      }
+      if (restoreDisplay && client.controller) {
+        try {
+          await client.controller.setScreenPowerMode(
+            AndroidScreenPowerMode.Normal,
+          );
+        } catch (error) {
+          failures.push(`恢复手机屏幕显示失败：${errorText(error)}`);
+        }
+      }
       try {
         await client.close();
       } catch (error) {
+        failures.push(`scrcpy 关闭失败：${errorText(error)}`);
+      }
+      if (failures.length) {
+        const error = new Error(failures.join("\n"));
         this.onStatus(
           `视频服务关闭失败：${errorText(error)}；请断开设备后重试。`,
         );

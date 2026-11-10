@@ -95,10 +95,18 @@ jobs:
           choose **Load unpacked**, and select the extracted folder containing `manifest.json`.
 
           This package includes Tango, the WebCodecs player, scrcpy-server 2.1 and third-party notices.
-          Remote sharing requires the project developer's HTTPS/WSS relay.
+          It supports local/remote touch, drag, keyboard and text input, local-priority takeover,
+          and host controls to turn off the phone's physical screen while mirroring continues.
+          Local USB mirroring and control do not require Google sign-in or a relay.
+
+          Remote sharing requires the updated HTTPS/WSS relay and Google OIDC configuration.
+          Only the Google account that created the share can view or control it.
+          The legacy anonymous-link sharing flow is not supported.
           See the repository README for setup, USB driver compatibility and deployment instructions.
 
-          Real Android-device and cross-network acceptance testing is still pending.
+          Preliminary local video testing of the first release is recorded in issue #1.
+          The newer input and physical-screen-off features still require real-device verification;
+          cross-network acceptance testing is also pending.
           NOTES
           args=(
             release create "$RELEASE_TAG"

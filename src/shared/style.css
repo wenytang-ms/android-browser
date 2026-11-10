@@ -53,11 +53,32 @@ canvas {
   width: auto;
   height: auto;
 }
+canvas[tabindex] {
+  touch-action: none;
+}
+textarea {
+  display: block;
+  width: 100%;
+  margin-top: 7px;
+  padding: 10px;
+  border: 1px solid #475b78;
+  border-radius: 7px;
+  font: inherit;
+}
 label {
   display: block;
   color: #c1cde0;
   margin-bottom: 14px;
   font-size: 14px;
+}
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.toggle input {
+  width: auto;
+  margin: 0;
 }
 input {
   display: block;

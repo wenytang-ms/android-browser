@@ -5,6 +5,8 @@ import { readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import type { RawData } from "ws";
+import { createGoogleAuth } from "./auth.js";
+import type { GoogleAuthOptions } from "./auth.js";
 import {
   decodeMedia,
   errorText,
@@ -33,12 +35,15 @@ interface Peer {
   authDeadline: number;
   requests: number;
   requestWindow: number;
+  accountToken?: string;
+  inputWindow: number;
+  inputs: number;
 }
 
 interface Session {
   id: string;
   hostToken: string;
-  viewerToken: string;
+  owner: string;
   expiresAt: number;
   offlineAt?: number;
   hostControl?: Peer;
@@ -46,6 +51,9 @@ interface Session {
   viewerControl?: Peer;
   viewerMedia?: Peer;
   viewerId?: string;
+  controlId?: string;
+  controlEnabled: boolean;
+  inputSequence: number;
   configuration?: Uint8Array;
   stream: number;
   sequence: number;
@@ -61,6 +69,7 @@ export interface RelayOptions {
   viewerDir: string;
   extensionOrigins?: string[];
   deploymentToken?: string;
+  google: GoogleAuthOptions;
   sessionMs?: number;
   offlineMs?: number;
   maxSessions?: number;
@@ -91,6 +100,24 @@ export function createRelay(options: RelayOptions) {
     ...(options.extensionOrigins ?? []),
   ]);
   const viewerRoot = resolve(options.viewerDir);
+  const identity = createGoogleAuth(
+    options.google,
+    publicOrigin,
+    allowedOrigins,
+    now,
+    (token) => {
+      for (const peer of peers) {
+        if (peer.accountToken !== token) continue;
+        if (peer.role === "host" && peer.session)
+          end(peer.session, "login-expired");
+        else {
+          if (peer.session?.viewerControl === peer)
+            setController(peer.session, undefined);
+          fail(peer, "login-required", "登录已注销或过期，请重新登录。");
+        }
+      }
+    },
+  );
 
   const server = createServer((request, response) => {
     void (async () => {
@@ -101,11 +128,13 @@ export function createRelay(options: RelayOptions) {
         "Content-Security-Policy",
         "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'",
       );
+      const requestUrl = new URL(request.url ?? "/", publicOrigin);
+      if (await identity.handle(request, response, requestUrl)) return;
       if (request.method !== "GET" && request.method !== "HEAD") {
         response.writeHead(405).end("Method not allowed");
         return;
       }
-      const path = new URL(request.url ?? "/", publicOrigin).pathname;
+      const path = requestUrl.pathname;
       if (path === "/health") {
         response.setHeader("Content-Type", "application/json");
         response.end(JSON.stringify({ status: "ok", sessions: sessions.size }));
@@ -185,6 +214,18 @@ export function createRelay(options: RelayOptions) {
     send(session.viewerControl, message);
   }
 
+  function setController(session: Session, controlId: string | undefined) {
+    session.controlId = controlId;
+    session.inputSequence = 0;
+    const message: ServerMessage = {
+      v: 1,
+      type: "controller",
+      controlId: controlId ?? null,
+    };
+    send(session.hostControl, message);
+    send(session.viewerControl, message);
+  }
+
   function clearMedia(session: Session) {
     session.configuration = undefined;
     session.waitingKey = true;
@@ -211,6 +252,12 @@ export function createRelay(options: RelayOptions) {
     const session = peer.session;
     if (!session || !sessions.has(session.id)) {
       fail(peer, "unauthorized", "请先完成会话授权。");
+      return;
+    }
+    const account = identity.account(peer.accountToken ?? "");
+    if (!account || account.subject !== session.owner) {
+      if (peer.role === "host") end(session, "login-expired");
+      else fail(peer, "login-required", "请重新登录创建分享的 Google 账号。");
       return;
     }
     if (now() >= session.expiresAt) {
@@ -240,6 +287,11 @@ export function createRelay(options: RelayOptions) {
   }
 
   function auth(peer: Peer, message: Extract<ClientMessage, { type: "auth" }>) {
+    const account = identity.account(message.accountToken);
+    if (!account) {
+      fail(peer, "login-required", "须先完成 Google 登录。");
+      return;
+    }
     const session = sessions.get(message.session);
     if (!session) {
       fail(peer, "session-ended", "会话不存在、已撤销或已过期。");
@@ -254,10 +306,12 @@ export function createRelay(options: RelayOptions) {
       fail(peer, "session-ended", "会话已结束，不能恢复旧凭据。");
       return;
     }
-    const expected =
-      message.role === "host" ? session.hostToken : session.viewerToken;
-    if (!secretEqual(message.token, expected)) {
-      fail(peer, "unauthorized", "分享凭据不正确。仅会话 ID 无法授权观看。");
+    if (
+      account.subject !== session.owner ||
+      (message.role === "host" &&
+        !secretEqual(message.token ?? "", session.hostToken))
+    ) {
+      fail(peer, "unauthorized", "只能使用创建分享的同一 Google 账号访问。");
       return;
     }
     if (message.role === "viewer") {
@@ -283,6 +337,7 @@ export function createRelay(options: RelayOptions) {
       return;
     }
     peer.role = message.role;
+    peer.accountToken = message.accountToken;
     peer.session = session;
     const slot =
       message.role === "host"
@@ -305,6 +360,20 @@ export function createRelay(options: RelayOptions) {
       send(session.hostControl, { v: 1, type: "resync" });
     }
     send(peer, { v: 1, type: "ready", expiresAt: session.expiresAt });
+    if (slot === "viewerControl")
+      send(peer, {
+        v: 1,
+        type: "control-permission",
+        enabled: session.controlEnabled,
+      });
+    if (
+      slot === "viewerControl" ||
+      (slot === "hostControl" && session.viewerControl)
+    )
+      setController(
+        session,
+        session.controlEnabled ? randomBytes(16).toString("hex") : undefined,
+      );
     broadcastState(session);
   }
 
@@ -322,6 +391,11 @@ export function createRelay(options: RelayOptions) {
         fail(peer, "wrong-channel", "须在会话通道创建分享。");
         return;
       }
+      const account = identity.account(message.accountToken);
+      if (!account) {
+        fail(peer, "login-required", "创建分享前须先完成 Google 登录。");
+        return;
+      }
       if (
         options.deploymentToken &&
         !secretEqual(message.deploymentToken, options.deploymentToken)
@@ -336,8 +410,8 @@ export function createRelay(options: RelayOptions) {
       const session: Session = {
         id: randomBytes(16).toString("hex"),
         hostToken: randomBytes(32).toString("hex"),
-        viewerToken: randomBytes(32).toString("hex"),
-        expiresAt: now() + sessionMs,
+        owner: account.subject,
+        expiresAt: Math.min(now() + sessionMs, account.expiresAt),
         hostControl: peer,
         stream: 0,
         sequence: 0,
@@ -346,16 +420,18 @@ export function createRelay(options: RelayOptions) {
         waitingKey: true,
         mediaWindow: now(),
         mediaBytes: 0,
+        inputSequence: 0,
+        controlEnabled: true,
       };
       sessions.set(session.id, session);
       peer.role = "host";
       peer.session = session;
+      peer.accountToken = message.accountToken;
       send(peer, {
         v: 1,
         type: "created",
         session: session.id,
         hostToken: session.hostToken,
-        viewerToken: session.viewerToken,
         expiresAt: session.expiresAt,
       });
       return;
@@ -363,6 +439,63 @@ export function createRelay(options: RelayOptions) {
     const session = live(peer);
     if (!session) return;
     switch (message.type) {
+      case "control-permission":
+        if (peer.role !== "host" || peer.channel !== "control") {
+          fail(peer, "forbidden", "只有宿主可以切换远程控制权限。");
+          break;
+        }
+        session.controlEnabled = message.enabled;
+        setController(
+          session,
+          message.enabled && session.viewerControl
+            ? randomBytes(16).toString("hex")
+            : undefined,
+        );
+        send(session.viewerControl, message);
+        if (message.enabled && session.viewerMedia) {
+          session.waitingKey = true;
+          send(session.hostControl, { v: 1, type: "resync" });
+        }
+        break;
+      case "input":
+        if (
+          peer.role !== "viewer" ||
+          peer.channel !== "control" ||
+          session.viewerControl !== peer
+        ) {
+          fail(peer, "forbidden", "只有当前同账号远端控制连接可以发送输入。");
+          break;
+        }
+        if (
+          message.controlId !== session.controlId ||
+          !session.controlEnabled ||
+          !session.hostControl ||
+          !session.hostMedia
+        ) {
+          send(peer, {
+            v: 1,
+            type: "controller",
+            controlId: session.controlId ?? null,
+          });
+          break;
+        }
+        if (message.sequence !== session.inputSequence + 1) {
+          fail(peer, "forbidden", "输入序列重复或已失效，请重新加入。");
+          break;
+        }
+        session.inputSequence = message.sequence;
+        if (
+          !session.configuration ||
+          session.waitingKey ||
+          message.stream !== session.stream
+        ) {
+          setController(session, randomBytes(16).toString("hex"));
+          session.waitingKey = true;
+          send(session.hostControl, { v: 1, type: "resync" });
+          break;
+        }
+        send(session.hostControl, message);
+        break;
       case "ping":
         send(peer, { v: 1, type: "pong" });
         break;
@@ -453,6 +586,7 @@ export function createRelay(options: RelayOptions) {
     const session = peer.session;
     if (!session || !sessions.has(session.id)) return;
     if (session.hostControl === peer) {
+      setController(session, undefined);
       session.hostControl = undefined;
       session.offlineAt = now();
       clearMedia(session);
@@ -466,6 +600,7 @@ export function createRelay(options: RelayOptions) {
       session.waitingKey = true;
     }
     if (session.viewerControl === peer) {
+      setController(session, undefined);
       session.viewerControl = undefined;
       const viewer = session.viewerMedia;
       session.viewerMedia = undefined;
@@ -486,6 +621,8 @@ export function createRelay(options: RelayOptions) {
       authDeadline: now() + 5_000,
       requests: 0,
       requestWindow: now(),
+      inputWindow: now(),
+      inputs: 0,
     };
     peers.add(peer);
     socket.on("pong", () => {
@@ -497,12 +634,21 @@ export function createRelay(options: RelayOptions) {
         if (!binary) {
           if (data.toString().length > 4096)
             throw new Error("Request too large.");
-          if (now() - peer.requestWindow >= 10_000) {
-            peer.requestWindow = now();
-            peer.requests = 0;
+          const message = parseClientMessage(data.toString());
+          if (message.type === "input") {
+            if (now() - peer.inputWindow >= 1_000) {
+              peer.inputWindow = now();
+              peer.inputs = 0;
+            }
+            if (++peer.inputs > 120) throw new Error("Too many input events.");
+          } else {
+            if (now() - peer.requestWindow >= 10_000) {
+              peer.requestWindow = now();
+              peer.requests = 0;
+            }
+            if (++peer.requests > 60) throw new Error("Too many requests.");
           }
-          if (++peer.requests > 60) throw new Error("Too many requests.");
-          control(peer, parseClientMessage(data.toString()));
+          control(peer, message);
         } else media(peer, rawBytes(data));
       } catch (error) {
         fail(peer, "protocol", errorText(error));
@@ -532,6 +678,7 @@ export function createRelay(options: RelayOptions) {
   });
 
   function sweep() {
+    identity.sweep();
     for (const session of sessions.values()) {
       if (now() >= session.expiresAt) end(session, "expired");
       else if (

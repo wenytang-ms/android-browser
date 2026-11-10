@@ -3,6 +3,8 @@ import { HostShare } from "./share.js";
 import { VideoPlayer } from "../shared/player.js";
 import { element, trackStats } from "../shared/ui.js";
 import { errorText, relayUrl } from "../shared/protocol.js";
+import { login, logout } from "../shared/auth.js";
+import { CanvasInput } from "../shared/input.js";
 import "../shared/style.css";
 
 const buttons = {
@@ -10,16 +12,35 @@ const buttons = {
   start: element("start", HTMLButtonElement),
   stop: element("stop", HTMLButtonElement),
   disconnect: element("disconnect", HTMLButtonElement),
+  screenOff: element("screen-off", HTMLButtonElement),
+  screenOn: element("screen-on", HTMLButtonElement),
   share: element("share", HTMLButtonElement),
   unshare: element("unshare", HTMLButtonElement),
 };
 const deviceStatus = element("device-status", HTMLParagraphElement);
+const screenStatus = element("screen-status", HTMLParagraphElement);
 const shareStatus = element("share-status", HTMLParagraphElement);
 const relay = element("relay", HTMLInputElement);
 const deploymentToken = element("deployment-token", HTMLInputElement);
 const link = element("link", HTMLInputElement);
+const canvas = element("screen", HTMLCanvasElement);
+const localControls = element("local-controls", HTMLFieldSetElement);
+const localText = element("local-text", HTMLTextAreaElement);
+const remoteControl = element("remote-control", HTMLInputElement);
 let busy = false;
 let shareBusy = false;
+let localStream = 0;
+let localConfigurationStream = 0;
+const localInput = new CanvasInput(canvas, (event) => {
+  const stream = localStream;
+  if (!stream) return;
+  if (event.kind !== "release") share.setRemoteControlEnabled(false);
+  void device.localInput(event, stream).catch((error: unknown) => {
+    if (!device.playing || stream !== localStream) return;
+    const message = `本地输入失败：${errorText(error)}；请重新开始投屏。`;
+    stopForInputError(message);
+  });
+});
 const share = new HostShare(
   (message) => {
     shareStatus.textContent = message;
@@ -28,9 +49,23 @@ const share = new HostShare(
   () => {
     void deviceAction(() => device.restartVideo());
   },
+  (id) => {
+    if (id) localInput.setEnabled(false, false);
+    void device.setRemoteController(id).catch((error: unknown) => {
+      shareStatus.textContent = `控制通道失败：${errorText(error)}；已停止远程控制。`;
+      if (device.playing) void deviceAction(() => device.stop());
+      void share.stop().catch((stopError: unknown) => {
+        shareStatus.textContent = `撤销失败：${errorText(stopError)}`;
+      });
+      update();
+    });
+    update();
+  },
+  (message, stream) =>
+    device.remoteInput(message.controlId, message.event, stream),
 );
 const player = new VideoPlayer(
-  element("screen", HTMLCanvasElement),
+  canvas,
   (message) => {
     deviceStatus.textContent = message;
     void device.stop().then(
@@ -42,6 +77,12 @@ const player = new VideoPlayer(
       },
     );
   },
+  undefined,
+  (stream) => {
+    if (stream !== localConfigurationStream || stream === localStream) return;
+    localStream = stream;
+    update();
+  },
 );
 const device = new DeviceSession(
   (message) => {
@@ -49,10 +90,15 @@ const device = new DeviceSession(
     update();
   },
   (packet) => {
+    if (packet.kind === "configuration") {
+      pauseLocalInput();
+      localConfigurationStream = packet.stream;
+    }
     player.push(packet);
     share.push(packet);
   },
   () => {
+    pauseLocalInput();
     player.reset();
     void share.stop().catch((error: unknown) => {
       shareStatus.textContent = `分享结束失败：${errorText(error)}`;
@@ -66,15 +112,44 @@ function update() {
   buttons.start.disabled = busy || !device.connected || device.playing;
   buttons.stop.disabled = busy || !device.playing;
   buttons.disconnect.disabled = busy || !device.connected;
+  buttons.screenOff.disabled = busy || !device.playing;
+  buttons.screenOn.disabled = busy || !device.playing;
+  screenStatus.textContent = !device.playing
+    ? "开始投屏后可关闭手机实体屏幕。"
+    : device.screenOff
+      ? "已请求息屏：浏览器画面与控制继续。"
+      : "未请求息屏／已请求恢复显示。";
   buttons.share.disabled = shareBusy || busy || !device.playing || share.active;
   buttons.unshare.disabled = shareBusy || !share.active;
   relay.disabled = share.active;
   deploymentToken.disabled = share.active;
+  remoteControl.disabled = !share.active || shareBusy;
+  remoteControl.checked = share.remoteControlEnabled;
+  const localEnabled = device.playing && !!localStream && !busy;
+  localControls.disabled = !localEnabled;
+  localInput.setEnabled(localEnabled);
   element("share-link", HTMLDivElement).hidden = !share.link;
   link.value = share.link;
   element("expiry", HTMLParagraphElement).textContent = share.link
     ? `到期：${new Date(share.expiresAt).toLocaleString()}`
     : "";
+}
+
+function pauseLocalInput() {
+  localInput.setEnabled(false, false);
+  localControls.disabled = true;
+  localStream = 0;
+  localConfigurationStream = 0;
+}
+
+function stopForInputError(message: string) {
+  void deviceAction(async () => {
+    try {
+      await device.stop();
+    } finally {
+      deviceStatus.textContent = message;
+    }
+  });
 }
 
 async function deviceAction(action: () => Promise<void>) {
@@ -102,14 +177,37 @@ buttons.stop.onclick = () => {
 buttons.disconnect.onclick = () => {
   void deviceAction(() => device.disconnect());
 };
+buttons.screenOff.onclick = () => {
+  void deviceAction(() => device.setScreenOff(true));
+};
+buttons.screenOn.onclick = () => {
+  void deviceAction(() => device.setScreenOff(false));
+};
 buttons.share.onclick = () => {
   void (async () => {
     shareBusy = true;
     update();
     try {
       const base = relayUrl(relay.value.trim());
-      await chrome.storage.local.set({ relay: base.origin });
-      await share.start(base, deploymentToken.value, device.configuration);
+      shareStatus.textContent =
+        "请登录 Google；开启共享将授权同账号远端观看和控制手机。";
+      const account = await login(base, true);
+      try {
+        await chrome.storage.local.set({ relay: base.origin });
+        await share.start(
+          base,
+          deploymentToken.value,
+          account.accountToken,
+          device.configuration,
+        );
+      } catch (error) {
+        try {
+          await logout(base, account.accountToken);
+        } catch (cleanupError) {
+          throw new Error(`${errorText(error)}\n${errorText(cleanupError)}`);
+        }
+        throw error;
+      }
     } catch (error) {
       shareStatus.textContent = `分享失败：${errorText(error)}`;
     } finally {
@@ -122,6 +220,30 @@ buttons.unshare.onclick = () => {
   void share.stop().catch((error: unknown) => {
     shareStatus.textContent = `撤销失败：${errorText(error)}`;
   });
+};
+remoteControl.onchange = () => {
+  if (remoteControl.checked) {
+    localInput.setEnabled(false, false);
+    void device.releaseInputs().catch((error: unknown) => {
+      stopForInputError(`输入释放失败：${errorText(error)}；请重新开始投屏。`);
+    });
+  }
+  share.setRemoteControlEnabled(remoteControl.checked);
+  update();
+};
+for (const [id, key] of [
+  ["local-back", 4],
+  ["local-home", 3],
+  ["local-apps", 187],
+] as const)
+  element(id, HTMLButtonElement).onclick = () => localInput.press(key);
+element("local-send-text", HTMLButtonElement).onclick = () => {
+  try {
+    localInput.text(localText.value);
+    localText.value = "";
+  } catch (error) {
+    deviceStatus.textContent = `文本发送失败：${errorText(error)}`;
+  }
 };
 element("copy", HTMLButtonElement).onclick = () => {
   void navigator.clipboard.writeText(share.link).then(
@@ -151,6 +273,8 @@ window.addEventListener(
   "pagehide",
   () => {
     stopStats();
+    localInput.setEnabled(false, false);
+    localInput.dispose();
     share.dispose();
     player.dispose();
     device.dispose();

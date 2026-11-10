@@ -3,6 +3,33 @@ import { ReadableStream } from "@yume-chan/stream-extra";
 import type { ReadableStreamDefaultController } from "@yume-chan/stream-extra";
 import { DeviceSession } from "../src/extension/device.js";
 import type { MediaPacket } from "../src/shared/protocol.js";
+import type { ScrcpyControlMessageWriter } from "@yume-chan/scrcpy";
+import { AndroidScreenPowerMode } from "@yume-chan/scrcpy";
+
+const mockController = () => ({
+  injectTouch: vi.fn<ScrcpyControlMessageWriter["injectTouch"]>(async () => {}),
+  injectKeyCode: vi.fn<ScrcpyControlMessageWriter["injectKeyCode"]>(
+    async () => {},
+  ),
+  setClipboard: vi.fn<ScrcpyControlMessageWriter["setClipboard"]>(
+    async () => {},
+  ),
+  setScreenPowerMode: vi.fn<ScrcpyControlMessageWriter["setScreenPowerMode"]>(
+    async () => {},
+  ),
+});
+
+const screen: MediaPacket = {
+  session: "0".repeat(32),
+  stream: 1,
+  sequence: 0,
+  kind: "configuration",
+  keyframe: false,
+  pts: 0n,
+  width: 720,
+  height: 1280,
+  data: new Uint8Array([0, 0, 0, 1]),
+};
 
 const services = vi.hoisted(() => ({
   requestDevice: vi.fn(),
@@ -51,7 +78,10 @@ describe("single Tango device lifecycle", () => {
     opened: boolean;
     close: ReturnType<typeof vi.fn<() => Promise<void>>>;
   };
-  let clients: { close: ReturnType<typeof vi.fn<() => Promise<void>>> }[];
+  let clients: {
+    close: ReturnType<typeof vi.fn<() => Promise<void>>>;
+    controller: ReturnType<typeof mockController>;
+  }[];
   let disconnectTransport: () => void;
 
   beforeEach(() => {
@@ -86,6 +116,7 @@ describe("single Tango device lifecycle", () => {
         data: Uint8Array;
       }>;
       const client = {
+        controller: mockController(),
         output: new ReadableStream<string>({
           start(controller) {
             output = controller;
@@ -178,5 +209,194 @@ describe("single Tango device lifecycle", () => {
       expect.stringContaining("transport close failed"),
     );
     expect(logged).toHaveBeenCalled();
+  });
+
+  it("supports local clicks, drags, keys and Unicode paste without a remote share or Google login", async () => {
+    await device.connect();
+    device.configuration = screen;
+    for (const action of ["down", "move", "up"] as const)
+      await device.localInput(
+        { kind: "touch", action, pointerId: 0, x: 0.5, y: 0.5 },
+        1,
+      );
+    await device.localInput(
+      { kind: "key", action: "down", keyCode: 29, metaState: 0 },
+      1,
+    );
+    await device.localInput(
+      { kind: "key", action: "up", keyCode: 29, metaState: 0 },
+      1,
+    );
+    await device.localInput({ kind: "text", text: "\u4f60\u597d" }, 1);
+    const writer = clients[0].controller;
+    expect(
+      writer.injectTouch.mock.calls.map(([event]) => event.action),
+    ).toEqual([0, 2, 1]);
+    expect(
+      writer.injectKeyCode.mock.calls.map(([event]) => event.action),
+    ).toEqual([0, 1]);
+    expect(writer.setClipboard).toHaveBeenCalledWith({
+      sequence: 0n,
+      paste: true,
+      content: "\u4f60\u597d",
+    });
+  });
+
+  it("releases the previous controller on takeover and preserves local input when remote control disconnects", async () => {
+    await device.connect();
+    device.configuration = screen;
+    const id = "a".repeat(32);
+    await device.setRemoteController(id);
+    await device.remoteInput(
+      id,
+      { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+      1,
+    );
+    await device.localInput(
+      { kind: "touch", action: "down", pointerId: 0, x: 0, y: 0 },
+      1,
+    );
+    expect(clients[0].controller.injectKeyCode).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: 1 }),
+    );
+    await device.setRemoteController(null);
+    await device.localInput(
+      { kind: "touch", action: "move", pointerId: 0, x: 0.5, y: 0.5 },
+      1,
+    );
+    await expect(
+      device.remoteInput(
+        id,
+        { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+        1,
+      ),
+    ).rejects.toThrow("授权");
+    await device.setRemoteController("b".repeat(32));
+    expect(clients[0].controller.injectTouch).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: 1 }),
+    );
+    expect(device.playing).toBe(true);
+  });
+
+  it("turns off only the physical display while local and authorized remote input remain usable", async () => {
+    await expect(device.setScreenOff(true)).rejects.toThrow("先开始投屏");
+    await device.connect();
+    device.configuration = screen;
+    const writer = clients[0].controller;
+    await device.setScreenOff(true);
+    expect(services.start.mock.calls[0][2].value.stayAwake).toBe(true);
+    expect(writer.setScreenPowerMode).toHaveBeenLastCalledWith(
+      AndroidScreenPowerMode.Off,
+    );
+    await device.localInput(
+      { kind: "key", action: "down", keyCode: 29, metaState: 0 },
+      1,
+    );
+    const id = "a".repeat(32);
+    await device.setRemoteController(id);
+    await device.setScreenOff(false);
+    await device.setScreenOff(true);
+    await device.remoteInput(
+      id,
+      { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+      1,
+    );
+    expect(writer.injectKeyCode).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: 0, keyCode: 66 }),
+    );
+    expect(device.playing && device.screenOff).toBe(true);
+    expect(device.configuration).toBe(screen);
+    expect(clients[0].close).not.toHaveBeenCalled();
+    expect(ended).not.toHaveBeenCalled();
+  });
+
+  it("restores normal display mode on stop, reapplies OFF after recovery, and resets it on manual restart", async () => {
+    await device.connect();
+    await device.setScreenOff(true);
+    await device.restartVideo();
+    expect(
+      clients[0].controller.setScreenPowerMode.mock.calls.map(([mode]) => mode),
+    ).toEqual([AndroidScreenPowerMode.Off, AndroidScreenPowerMode.Normal]);
+    expect(clients[1].controller.setScreenPowerMode).toHaveBeenCalledWith(
+      AndroidScreenPowerMode.Off,
+    );
+    expect(device.screenOff).toBe(true);
+    expect(ended).not.toHaveBeenCalled();
+    await device.stop();
+    expect(clients[1].controller.setScreenPowerMode).toHaveBeenLastCalledWith(
+      AndroidScreenPowerMode.Normal,
+    );
+    expect(device.screenOff).toBe(false);
+    await device.start();
+    expect(clients[2].controller.setScreenPowerMode).not.toHaveBeenCalled();
+  });
+
+  it.each(["input", "display"] as const)(
+    "still closes scrcpy and surfaces a %s restoration failure",
+    async (failure) => {
+      await device.connect();
+      device.configuration = screen;
+      await device.localInput(
+        { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+        1,
+      );
+      await device.setScreenOff(true);
+      const writer = clients[0].controller;
+      if (failure === "input")
+        writer.injectKeyCode.mockRejectedValueOnce(
+          new Error("key release failed"),
+        );
+      else
+        writer.setScreenPowerMode.mockRejectedValueOnce(
+          new Error("display restore failed"),
+        );
+      await expect(device.stop()).rejects.toThrow(
+        failure === "input" ? "key release failed" : "display restore failed",
+      );
+      expect(writer.setScreenPowerMode).toHaveBeenLastCalledWith(
+        AndroidScreenPowerMode.Normal,
+      );
+      expect(clients[0].close).toHaveBeenCalledOnce();
+      expect(device.playing).toBe(false);
+      expect(status).toHaveBeenLastCalledWith(
+        expect.stringContaining("关闭失败"),
+      );
+    },
+  );
+
+  it("reports failed OFF writes and still attempts display restoration before closing", async () => {
+    await device.connect();
+    clients[0].controller.setScreenPowerMode.mockRejectedValueOnce(
+      new Error("display write failed"),
+    );
+    await expect(device.setScreenOff(true)).rejects.toThrow(
+      "display write failed",
+    );
+    expect(device.screenOff).toBe(false);
+    expect(device.playing).toBe(true);
+    await device.stop();
+    expect(clients[0].controller.setScreenPowerMode).toHaveBeenLastCalledWith(
+      AndroidScreenPowerMode.Normal,
+    );
+  });
+
+  it("does not restore stale screen-off state after disconnect during a pending OFF request", async () => {
+    await device.connect();
+    let unblock!: () => void;
+    clients[0].controller.setScreenPowerMode.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          unblock = resolve;
+        }),
+    );
+    const off = device.setScreenOff(true);
+    const disconnected = device.disconnect();
+    unblock();
+    await Promise.all([off, disconnected]);
+    expect(device.screenOff).toBe(false);
+    expect(device.connected).toBe(false);
+    expect(clients[0].controller.setScreenPowerMode).toHaveBeenLastCalledWith(
+      AndroidScreenPowerMode.Normal,
+    );
   });
 });
