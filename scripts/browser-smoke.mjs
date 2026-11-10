@@ -41,6 +41,15 @@ function connect(url, authentication) {
   });
 }
 
+function fixtureHasAudio() {
+  return globalThis.fixtureAudioAnalysers.some((analyser) => {
+    if (analyser.context.state !== "running") return false;
+    const data = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(data);
+    return data.some((sample) => Math.abs(sample) > 0.05);
+  });
+}
+
 try {
   fixtureDirectory = await mkdtemp(
     resolve("node_modules", ".tango-extension-"),
@@ -92,6 +101,7 @@ try {
   assert.equal(await extensionPage.locator("#share").isDisabled(), true);
   assert.equal(await extensionPage.locator("#screen-off").isDisabled(), true);
   assert.equal(await extensionPage.locator("#screen-on").isDisabled(), true);
+  assert.equal(await extensionPage.locator("#audio-toggle").isDisabled(), true);
   assert.equal(extensionErrors.length, 0, extensionErrors.join("; "));
   console.log(
     "MV3 extension: unpacked load, bundled SDK, CSP and initial device UI passed.",
@@ -366,6 +376,24 @@ try {
     "Browser viewer: signed identity flow, real H.264, touch/key/text controls and revocation passed (synthetic Google/Android fixtures).",
   );
   const localPage = await context.newPage();
+  await localPage.addInitScript(() => {
+    globalThis.fixtureAudioContexts = [];
+    globalThis.fixtureAudioAnalysers = [];
+    const NativeAudioContext = globalThis.AudioContext;
+    globalThis.AudioContext = class extends NativeAudioContext {
+      constructor(options) {
+        super(options);
+        globalThis.fixtureAudioContexts.push(this);
+      }
+      createGain() {
+        const gain = super.createGain();
+        const analyser = this.createAnalyser();
+        gain.connect(analyser);
+        globalThis.fixtureAudioAnalysers.push(analyser);
+        return gain;
+      }
+    };
+  });
   localPage.on("pageerror", (error) => extensionErrors.push(error.message));
   await localPage.exposeFunction("fixtureLogin", async (startUrl) => {
     const response = await fetch(startUrl, { redirect: "manual" });
@@ -397,6 +425,28 @@ try {
       !document.querySelector("#local-back").disabled &&
       !document.querySelector("#local-controls").disabled,
   );
+  await localPage.waitForFunction(fixtureHasAudio);
+  assert.equal(await localPage.locator("#audio-forward").isDisabled(), true);
+  await localPage.locator("#audio-toggle").click();
+  await localPage.waitForFunction(() =>
+    document.querySelector("#audio-status").textContent.includes("网页已静音"),
+  );
+  const mutedPackets = await localPage.evaluate(
+    () => globalThis.tangoFixture.audioPackets,
+  );
+  await localPage.waitForFunction(() =>
+    globalThis.fixtureAudioAnalysers.every((analyser) => {
+      const data = new Float32Array(analyser.fftSize);
+      analyser.getFloatTimeDomainData(data);
+      return data.every((sample) => Math.abs(sample) < 0.0001);
+    }),
+  );
+  await localPage.waitForFunction(
+    (previous) => globalThis.tangoFixture.audioPackets > previous,
+    mutedPackets,
+  );
+  await localPage.locator("#audio-toggle").click();
+  await localPage.waitForFunction(fixtureHasAudio);
   await localPage.evaluate(() => {
     globalThis.tangoFixture.failScreenPower = true;
   });
@@ -414,6 +464,7 @@ try {
   await localPage.waitForFunction(() =>
     document.querySelector("#screen-status").textContent.includes("已请求息屏"),
   );
+  await localPage.waitForFunction(fixtureHasAudio);
   await localPage.locator("#screen").click();
   const bounds = await localPage.locator("#screen").boundingBox();
   assert(bounds, "Local canvas must be visible.");
@@ -543,6 +594,7 @@ try {
     document.querySelector("#status").textContent.includes("撤销"),
   );
   assert.equal(await localPage.locator("#local-home").isEnabled(), true);
+  await localPage.waitForFunction(fixtureHasAudio);
   assert(
     (await localPage.locator("#screen-status").textContent()).includes(
       "已请求息屏",
@@ -559,9 +611,41 @@ try {
     ),
     false,
   );
+  await localPage.waitForFunction(() =>
+    globalThis.fixtureAudioContexts.every(
+      (context) => context.state === "closed",
+    ),
+  );
+  await localPage.locator("#audio-forward").uncheck();
   await localPage.locator("#start").click();
   await localPage.waitForFunction(
     () => !document.querySelector("#local-controls").disabled,
+  );
+  assert.equal(await localPage.locator("#audio-toggle").isDisabled(), true);
+  assert(
+    (await localPage.locator("#audio-status").textContent()).includes(
+      "Synthetic audio disabled.",
+    ),
+  );
+  await localPage.locator("#stop").click();
+  await localPage.locator("#audio-forward").check();
+  await localPage.evaluate(() => {
+    globalThis.tangoFixture.audioAvailable = false;
+  });
+  await localPage.locator("#start").click();
+  await localPage.waitForFunction(
+    () => !document.querySelector("#local-controls").disabled,
+  );
+  assert(
+    (await localPage.locator("#audio-status").textContent()).includes(
+      "Synthetic audio unavailable.",
+    ),
+  );
+  assert.equal(await localPage.locator("#local-home").isEnabled(), true);
+  await localPage.waitForFunction(() =>
+    globalThis.fixtureAudioContexts.every(
+      (context) => context.state === "closed",
+    ),
   );
   assert(
     (await localPage.locator("#screen-status").textContent()).includes(
@@ -575,7 +659,7 @@ try {
   );
   assert.equal(errors.length, 0, `Viewer runtime errors: ${errors.join("; ")}`);
   console.log(
-    "Browser host: local/remote input, display-off controls and error reporting, local takeover, read-only video, remote re-enable and lifecycle passed (synthetic device session).",
+    "Browser host: real Web Audio PCM output, mute/resume and cleanup, audio opt-out/unavailability, local/remote input, screen-off and local takeover passed (synthetic device session).",
   );
 } finally {
   hostControl?.terminate();

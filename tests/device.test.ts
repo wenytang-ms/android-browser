@@ -3,8 +3,16 @@ import { ReadableStream } from "@yume-chan/stream-extra";
 import type { ReadableStreamDefaultController } from "@yume-chan/stream-extra";
 import { DeviceSession } from "../src/extension/device.js";
 import type { MediaPacket } from "../src/shared/protocol.js";
-import type { ScrcpyControlMessageWriter } from "@yume-chan/scrcpy";
-import { AndroidScreenPowerMode } from "@yume-chan/scrcpy";
+import type {
+  ScrcpyControlMessageWriter,
+  ScrcpyMediaStreamPacket,
+} from "@yume-chan/scrcpy";
+import { AndroidScreenPowerMode, ScrcpyAudioCodec } from "@yume-chan/scrcpy";
+import type { AdbScrcpyAudioStreamMetadata } from "@yume-chan/adb-scrcpy";
+import type {
+  LocalAudioPacket,
+  LocalAudioStatus,
+} from "../src/shared/audio-player.js";
 
 const mockController = () => ({
   injectTouch: vi.fn<ScrcpyControlMessageWriter["injectTouch"]>(async () => {}),
@@ -37,6 +45,7 @@ const services = vi.hoisted(() => ({
   pushServer: vi.fn(),
   start: vi.fn(),
   adbClose: vi.fn(),
+  audio: vi.fn<() => Promise<AdbScrcpyAudioStreamMetadata>>(),
 }));
 
 vi.mock("@yume-chan/adb-daemon-webusb", () => ({
@@ -83,6 +92,8 @@ describe("single Tango device lifecycle", () => {
     controller: ReturnType<typeof mockController>;
   }[];
   let disconnectTransport: () => void;
+  let audioPacket: ReturnType<typeof vi.fn<(packet: LocalAudioPacket) => void>>;
+  let audioStatus: ReturnType<typeof vi.fn<(status: LocalAudioStatus) => void>>;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -107,6 +118,7 @@ describe("single Tango device lifecycle", () => {
     });
     services.pushServer.mockResolvedValue(undefined);
     services.adbClose.mockResolvedValue(undefined);
+    services.audio.mockResolvedValue({ type: "disabled" });
     services.start.mockImplementation(async () => {
       let output: ReadableStreamDefaultController<string>;
       let video: ReadableStreamDefaultController<{
@@ -117,6 +129,7 @@ describe("single Tango device lifecycle", () => {
       }>;
       const client = {
         controller: mockController(),
+        audioStream: services.audio(),
         output: new ReadableStream<string>({
           start(controller) {
             output = controller;
@@ -152,7 +165,9 @@ describe("single Tango device lifecycle", () => {
     ended = vi.fn<() => void>();
     status = vi.fn<(message: string) => void>();
     packet = vi.fn<(packet: MediaPacket) => void>();
-    device = new DeviceSession(status, packet, ended);
+    audioPacket = vi.fn();
+    audioStatus = vi.fn();
+    device = new DeviceSession(status, packet, ended, audioPacket, audioStatus);
   });
   afterEach(async () => {
     await device.disconnect();
@@ -398,5 +413,96 @@ describe("single Tango device lifecycle", () => {
     expect(clients[0].controller.setScreenPowerMode).toHaveBeenLastCalledWith(
       AndroidScreenPowerMode.Normal,
     );
+  });
+
+  it("consumes RAW output audio only through the local callback and cancels capture on stop", async () => {
+    let send!: ReadableStreamDefaultController<ScrcpyMediaStreamPacket>;
+    const cancel = vi.fn();
+    services.audio.mockResolvedValue({
+      type: "success",
+      codec: ScrcpyAudioCodec.Raw,
+      stream: new ReadableStream({
+        start(controller) {
+          send = controller;
+        },
+        cancel,
+      }),
+    });
+    await device.connect();
+    const options = services.start.mock.calls[0][2].value;
+    expect(
+      options.audio &&
+        options.audioSource === "output" &&
+        options.audioCodec === "raw",
+    ).toBe(true);
+    send.enqueue({ type: "data", pts: 1_000n, data: new Uint8Array(960) });
+    await vi.waitFor(() => expect(audioPacket).toHaveBeenCalledOnce());
+    expect(audioPacket).toHaveBeenCalledWith(
+      expect.objectContaining({ pts: 1_000n }),
+    );
+    expect(packet).not.toHaveBeenCalled();
+    expect(device.audioForwarding && device.playing).toBe(true);
+    await device.stop();
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    expect(clients[0].close.mock.invocationCallOrder[0]).toBeLessThan(
+      cancel.mock.invocationCallOrder[0],
+    );
+    expect(device.audioForwarding).toBe(false);
+    expect(audioStatus).toHaveBeenLastCalledWith(
+      expect.objectContaining({ state: "stopped" }),
+    );
+  });
+
+  it("reports unavailable audio without preventing local video and input", async () => {
+    services.audio.mockResolvedValue({ type: "disabled" });
+    await device.connect();
+    await vi.waitFor(() =>
+      expect(audioStatus).toHaveBeenCalledWith(
+        expect.objectContaining({ state: "unavailable" }),
+      ),
+    );
+    device.configuration = screen;
+    await device.localInput(
+      { kind: "key", action: "down", keyCode: 66, metaState: 0 },
+      1,
+    );
+    expect(device.playing).toBe(true);
+    expect(clients[0].close).not.toHaveBeenCalled();
+  });
+
+  it("reports audio transport failure while leaving video running", async () => {
+    let send!: ReadableStreamDefaultController<ScrcpyMediaStreamPacket>;
+    services.audio.mockResolvedValue({
+      type: "success",
+      codec: ScrcpyAudioCodec.Raw,
+      stream: new ReadableStream({
+        start(controller) {
+          send = controller;
+        },
+      }),
+    });
+    await device.connect();
+    send.error(new Error("synthetic audio failure"));
+    await vi.waitFor(() =>
+      expect(audioStatus).toHaveBeenCalledWith(
+        expect.objectContaining({
+          state: "unavailable",
+          message: expect.stringContaining("synthetic audio failure"),
+        }),
+      ),
+    );
+    expect(device.playing).toBe(true);
+    expect(device.audioForwarding).toBe(false);
+  });
+
+  it("lets a stopped session opt out of capturing the phone's media audio", async () => {
+    device.audioEnabled = false;
+    await device.connect();
+    expect(services.start.mock.calls[0][2].value.audio).toBe(false);
+    expect(audioStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ state: "disabled" }),
+    );
+    expect(device.playing).toBe(true);
+    expect(device.audioForwarding).toBe(false);
   });
 });

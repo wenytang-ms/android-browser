@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, for example 0.0.1-alpha (without v)"
+        description: "Release version, for example 0.0.3-alpha (without v)"
         required: true
-        default: "0.0.1-alpha"
+        default: "0.0.3-alpha"
         type: string
 
 permissions:
@@ -99,13 +99,25 @@ jobs:
           and host controls to turn off the phone's physical screen while mirroring continues.
           Local USB mirroring and control do not require Google sign-in or a relay.
 
+          ## New in 0.0.3-alpha: local media audio
+
+          On Android 11+, phone media audio can play in the host's local webpage instead of
+          the phone speaker or headset. Calls, notifications and alarms remain unchanged.
+          Android 11 must be unlocked when audio capture starts.
+          Audio is local-only: no remote audio, microphone capture or recording.
+
+          Keep **Forward phone media audio** enabled before connecting or starting mirroring.
+          Browser mute silences only the webpage; it does not restore phone media output.
+          Stop mirroring to restore phone output, or stop, disable audio forwarding and restart
+          for video-only mirroring. If audio is unavailable, video and input remain available.
+
           Remote sharing requires the updated HTTPS/WSS relay and Google OIDC configuration.
           Only the Google account that created the share can view or control it.
           The legacy anonymous-link sharing flow is not supported.
           See the repository README for setup, USB driver compatibility and deployment instructions.
 
           Preliminary local video testing of the first release is recorded in issue #1.
-          The newer input and physical-screen-off features still require real-device verification;
+          The newer input, physical-screen-off and local-audio features still require real-device verification;
           cross-network acceptance testing is also pending.
           NOTES
           args=(

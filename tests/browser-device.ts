@@ -1,4 +1,8 @@
 import type { MediaPacket, RemoteInput } from "../src/shared/protocol.js";
+import type {
+  LocalAudioPacket,
+  LocalAudioStatus,
+} from "../src/shared/audio-player.js";
 
 const fixture: {
   configuration: number[];
@@ -6,12 +10,16 @@ const fixture: {
   inputs: { source: "local" | "remote"; event: RemoteInput }[];
   screenPowerRequests: boolean[];
   failScreenPower: boolean;
+  audioAvailable: boolean;
+  audioPackets: number;
 } = {
   configuration: [],
   frame: [],
   inputs: [],
   screenPowerRequests: [],
   failScreenPower: false,
+  audioAvailable: true,
+  audioPackets: 0,
 };
 Object.defineProperty(globalThis, "tangoFixture", { value: fixture });
 
@@ -21,15 +29,22 @@ export class DeviceSession {
   connected = false;
   playing = false;
   screenOff = false;
+  audioEnabled = true;
+  audioForwarding = false;
   private stream = 0;
   private sequence = 0;
   private timer?: ReturnType<typeof setInterval>;
+  private audioTimer?: ReturnType<typeof setInterval>;
   private controller: string | null = null;
 
   constructor(
     private readonly onStatus: (message: string) => void,
     private readonly onPacket: (packet: MediaPacket) => void,
     private readonly onEnded: () => void,
+    private readonly onAudio: (packet: LocalAudioPacket) => void = () => {},
+    private readonly onAudioStatus: (
+      status: LocalAudioStatus,
+    ) => void = () => {},
   ) {}
 
   async connect() {
@@ -54,6 +69,41 @@ export class DeviceSession {
     this.configuration = configuration;
     this.onStatus("Synthetic Android connected.");
     this.onPacket(this.configuration);
+    this.audioForwarding = this.audioEnabled && fixture.audioAvailable;
+    this.onAudioStatus({
+      state: this.audioForwarding
+        ? "forwarding"
+        : this.audioEnabled
+          ? "unavailable"
+          : "disabled",
+      message: this.audioForwarding
+        ? "Synthetic local audio forwarding."
+        : this.audioEnabled
+          ? "Synthetic audio unavailable."
+          : "Synthetic audio disabled.",
+    });
+    if (this.audioForwarding) {
+      let samples = 0;
+      const stream = this.stream;
+      this.audioTimer = setInterval(() => {
+        const data = new Uint8Array(960);
+        const view = new DataView(data.buffer);
+        for (let frame = 0; frame < 240; ++frame) {
+          const sample = Math.round(
+            Math.sin(((samples + frame) * 2 * Math.PI * 440) / 48_000) * 10_000,
+          );
+          view.setInt16(frame * 4, sample, true);
+          view.setInt16(frame * 4 + 2, sample, true);
+        }
+        ++fixture.audioPackets;
+        this.onAudio({
+          stream,
+          pts: BigInt(Math.floor((samples * 1_000_000) / 48_000)),
+          data,
+        });
+        samples += 240;
+      }, 5);
+    }
     this.timer = setInterval(() => {
       this.onPacket({
         ...configuration,
@@ -104,6 +154,12 @@ export class DeviceSession {
 
   async stop(preserveShare = false) {
     clearInterval(this.timer);
+    clearInterval(this.audioTimer);
+    this.audioForwarding = false;
+    this.onAudioStatus({
+      state: "stopped",
+      message: "Synthetic audio stopped.",
+    });
     if (this.screenOff) fixture.screenPowerRequests.push(false);
     if (!preserveShare) this.screenOff = false;
     this.playing = false;
@@ -119,5 +175,6 @@ export class DeviceSession {
 
   dispose() {
     clearInterval(this.timer);
+    clearInterval(this.audioTimer);
   }
 }

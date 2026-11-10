@@ -21,6 +21,22 @@
             ></canvas>
           </div>
           <p id="stats" class="stats" aria-live="off">等待视频</p>
+          <section class="panel">
+            <h2>本地声音</h2>
+            <label class="toggle">
+              <input id="audio-forward" type="checkbox" checked />
+              转发手机媒体声音（开始投屏时生效）
+            </label>
+            <button id="audio-toggle" disabled>启用网页声音</button>
+            <p id="audio-status" class="status" role="status">
+              连接后可在本地网页播放手机媒体声音。
+            </p>
+            <p class="hint">
+              仅本地网页播放，不传到远端，不采集麦克风。转发时手机不外放被转发的媒体声，
+              电话、通知和闹钟不受影响。网页静音不会恢复手机发声；停止投屏后恢复。
+              需要 Android 11+；Android 11 启动采集前请先解锁。
+            </p>
+          </section>
           <fieldset id="local-controls" class="panel" disabled>
             <legend>本地手机控制（无需登录）</legend>
             <button id="local-back">返回</button>

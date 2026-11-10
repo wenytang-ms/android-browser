@@ -12,12 +12,21 @@ import {
   DefaultServerPath,
   h264ParseConfiguration,
   ScrcpyVideoCodecId,
+  ScrcpyAudioCodec,
 } from "@yume-chan/scrcpy";
-import { ReadableStream, WritableStream } from "@yume-chan/stream-extra";
+import {
+  AbortController,
+  ReadableStream,
+  WritableStream,
+} from "@yume-chan/stream-extra";
 import { checkDecoderSupport } from "../shared/player.js";
 import { errorText } from "../shared/protocol.js";
 import type { MediaPacket, RemoteInput } from "../shared/protocol.js";
 import { DeviceInputController } from "./input.js";
+import type {
+  LocalAudioPacket,
+  LocalAudioStatus,
+} from "../shared/audio-player.js";
 
 export const VIDEO_SETTINGS = {
   maxSize: 1280,
@@ -32,6 +41,7 @@ export class DeviceSession {
   private adb?: Adb;
   private client?: DeviceClient;
   private restoreDisplay = false;
+  private audioAbort?: AbortController;
   private input?: DeviceInputController;
   private inputController = LOCAL_CONTROLLER;
   private operation = false;
@@ -48,11 +58,17 @@ export class DeviceSession {
   connected = false;
   playing = false;
   screenOff = false;
+  audioEnabled = true;
+  audioForwarding = false;
 
   constructor(
     private readonly onStatus: (message: string) => void,
     private readonly onPacket: (packet: MediaPacket) => void,
     private readonly onEnded: () => void,
+    private readonly onAudio: (packet: LocalAudioPacket) => void = () => {},
+    private readonly onAudioStatus: (
+      status: LocalAudioStatus,
+    ) => void = () => {},
   ) {
     navigator.usb?.addEventListener("disconnect", this.usbDisconnect);
   }
@@ -171,13 +187,21 @@ export class DeviceSession {
       );
       if (epoch !== this.epoch) return;
       this.onStatus("正在启动手机视频服务…");
+      this.onAudioStatus({
+        state: this.audioEnabled ? "starting" : "disabled",
+        message: this.audioEnabled
+          ? "正在启动本地媒体音频转发…"
+          : "未开启音频转发；手机按原方式发声。",
+      });
       const client = await AdbScrcpyClient.start(
         adb,
         DefaultServerPath,
         new AdbScrcpyOptions2_1({
           ...VIDEO_SETTINGS,
           video: true,
-          audio: false,
+          audio: this.audioEnabled,
+          audioSource: "output",
+          audioCodec: "raw",
           control: true,
           stayAwake: true,
           cleanup: true,
@@ -195,10 +219,18 @@ export class DeviceSession {
         }),
       );
       if (epoch !== this.epoch) {
+        const abort = new AbortController();
+        abort.abort();
+        void this.readAudio(client, epoch, abort);
         await client.close();
         return;
       }
       this.client = client;
+      if (this.audioEnabled) {
+        const abort = new AbortController();
+        this.audioAbort = abort;
+        void this.readAudio(client, epoch, abort);
+      }
       if (!client.controller) throw new Error("设备没有提供 scrcpy 控制通道。");
       const input = new DeviceInputController(client.controller, () =>
         this.playing ? this.configuration : undefined,
@@ -310,6 +342,73 @@ export class DeviceSession {
     await this.start();
   }
 
+  private async readAudio(
+    client: DeviceClient,
+    epoch: number,
+    abort: AbortController,
+  ) {
+    try {
+      const audio = await client.audioStream;
+      if (abort.signal.aborted) {
+        if (audio?.type === "success") await audio.stream.cancel();
+        return;
+      }
+      if (!audio || audio.type !== "success") {
+        if (epoch === this.epoch)
+          this.onAudioStatus({
+            state: "unavailable",
+            message:
+              "音频不可用，视频继续。需要 Android 11+；Android 11 启动采集前请先解锁手机。",
+          });
+        return;
+      }
+      const supported = audio.codec === ScrcpyAudioCodec.Raw;
+      if (epoch === this.epoch) {
+        this.audioForwarding = supported;
+        this.onAudioStatus({
+          state: supported ? "forwarding" : "unavailable",
+          message: supported
+            ? "媒体声音已转发至本地网页，手机不再外放被转发的媒体声；电话、通知和闹钟不受影响。"
+            : "设备未返回所需 PCM 音频；仅播放视频。",
+        });
+      }
+      let valid = supported;
+      await audio.stream.pipeTo(
+        new WritableStream({
+          write: (packet) => {
+            if (epoch !== this.epoch || !valid) return;
+            if (packet.type !== "data" || packet.pts === undefined) {
+              valid = false;
+              this.audioForwarding = false;
+              this.onAudioStatus({
+                state: "unavailable",
+                message:
+                  "音频缺少数据帧或时间戳；视频继续。请停止后重新开始投屏。",
+              });
+              return;
+            }
+            this.onAudio({ stream: epoch, pts: packet.pts, data: packet.data });
+          },
+        }),
+        { signal: abort.signal },
+      );
+      if (epoch === this.epoch && !abort.signal.aborted) {
+        this.audioForwarding = false;
+        this.onAudioStatus({
+          state: "unavailable",
+          message: "手机音频流已结束；视频继续。可停止后重新开始投屏。",
+        });
+      }
+    } catch (error) {
+      if (epoch !== this.epoch || abort.signal.aborted) return;
+      this.audioForwarding = false;
+      this.onAudioStatus({
+        state: "unavailable",
+        message: `音频通道失败：${errorText(error)}；视频继续。`,
+      });
+    }
+  }
+
   async setRemoteController(id: string | null) {
     if (id && (!this.playing || !this.input))
       throw new Error("设备控制通道不可用。");
@@ -370,6 +469,13 @@ export class DeviceSession {
     this.closing = true;
     ++this.epoch;
     this.playing = false;
+    this.audioForwarding = false;
+    const audioAbort = this.audioAbort;
+    this.audioAbort = undefined;
+    this.onAudioStatus({
+      state: "stopped",
+      message: "音频转发已停止；设备采集退出后手机恢复原有媒体输出。",
+    });
     this.configuration = undefined;
     const client = this.client;
     this.client = undefined;
@@ -399,6 +505,8 @@ export class DeviceSession {
         await client.close();
       } catch (error) {
         failures.push(`scrcpy 关闭失败：${errorText(error)}`);
+      } finally {
+        audioAbort?.abort();
       }
       if (failures.length) {
         const error = new Error(failures.join("\n"));
@@ -407,7 +515,7 @@ export class DeviceSession {
         );
         throw error;
       }
-    }
+    } else audioAbort?.abort();
     this.closing = false;
     this.onStatus(
       this.connected ? "本地投屏已停止，可以再次开始。" : "设备未连接。",

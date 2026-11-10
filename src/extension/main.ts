@@ -5,6 +5,8 @@ import { element, trackStats } from "../shared/ui.js";
 import { errorText, relayUrl } from "../shared/protocol.js";
 import { login, logout } from "../shared/auth.js";
 import { CanvasInput } from "../shared/input.js";
+import { AudioPlayer } from "../shared/audio-player.js";
+import type { LocalAudioStatus } from "../shared/audio-player.js";
 import "../shared/style.css";
 
 const buttons = {
@@ -14,11 +16,14 @@ const buttons = {
   disconnect: element("disconnect", HTMLButtonElement),
   screenOff: element("screen-off", HTMLButtonElement),
   screenOn: element("screen-on", HTMLButtonElement),
+  audio: element("audio-toggle", HTMLButtonElement),
   share: element("share", HTMLButtonElement),
   unshare: element("unshare", HTMLButtonElement),
 };
 const deviceStatus = element("device-status", HTMLParagraphElement);
 const screenStatus = element("screen-status", HTMLParagraphElement);
+const audioStatus = element("audio-status", HTMLParagraphElement);
+const audioForward = element("audio-forward", HTMLInputElement);
 const shareStatus = element("share-status", HTMLParagraphElement);
 const relay = element("relay", HTMLInputElement);
 const deploymentToken = element("deployment-token", HTMLInputElement);
@@ -31,6 +36,15 @@ let busy = false;
 let shareBusy = false;
 let localStream = 0;
 let localConfigurationStream = 0;
+let audioError = "";
+let audioState: LocalAudioStatus = {
+  state: "stopped",
+  message: "连接后可在本地网页播放手机媒体声音。",
+};
+const audioPlayer = new AudioPlayer((message) => {
+  audioError = message;
+  updateAudio();
+}, updateAudio);
 const localInput = new CanvasInput(canvas, (event) => {
   const stream = localStream;
   if (!stream) return;
@@ -100,10 +114,19 @@ const device = new DeviceSession(
   () => {
     pauseLocalInput();
     player.reset();
+    audioPlayer.close();
     void share.stop().catch((error: unknown) => {
       shareStatus.textContent = `分享结束失败：${errorText(error)}`;
     });
     update();
+  },
+  (packet) => audioPlayer.push(packet),
+  (status) => {
+    audioState = status;
+    if (status.state !== "forwarding") audioPlayer.reset();
+    if (status.state === "unavailable" || status.state === "disabled")
+      audioPlayer.close();
+    updateAudio();
   },
 );
 
@@ -133,6 +156,34 @@ function update() {
   element("expiry", HTMLParagraphElement).textContent = share.link
     ? `到期：${new Date(share.expiresAt).toLocaleString()}`
     : "";
+  updateAudio();
+}
+
+function updateAudio() {
+  audioForward.disabled = busy || device.playing;
+  buttons.audio.disabled = busy || !device.playing || !device.audioForwarding;
+  buttons.audio.textContent = audioPlayer.active ? "网页静音" : "启用网页声音";
+  const playback =
+    audioError ||
+    (audioState.state === "forwarding"
+      ? audioPlayer.active
+        ? "网页正在播放手机媒体声音（仅本地）。"
+        : audioPlayer.muted
+          ? "网页已静音；手机媒体声仍在转发。"
+          : "请点击“启用网页声音”；手机媒体声仍在转发。"
+      : "");
+  audioStatus.textContent = `${audioState.message}${playback ? `\n${playback}` : ""}`;
+}
+
+function audioFailure(error: unknown) {
+  audioError = `网页声音未能启用：${errorText(error)}。可点击启用声音重试，或停止投屏恢复手机发声。`;
+  updateAudio();
+}
+
+function prepareAudio() {
+  device.audioEnabled = audioForward.checked;
+  audioError = "";
+  if (device.audioEnabled) void audioPlayer.resume().catch(audioFailure);
 }
 
 function pauseLocalInput() {
@@ -161,14 +212,17 @@ async function deviceAction(action: () => Promise<void>) {
     deviceStatus.textContent = `${deviceStatus.textContent}\n${errorText(error)}`;
   } finally {
     busy = false;
+    if (!device.playing) audioPlayer.close();
     update();
   }
 }
 
 buttons.connect.onclick = () => {
+  prepareAudio();
   void deviceAction(() => device.connect());
 };
 buttons.start.onclick = () => {
+  prepareAudio();
   void deviceAction(() => device.start());
 };
 buttons.stop.onclick = () => {
@@ -182,6 +236,13 @@ buttons.screenOff.onclick = () => {
 };
 buttons.screenOn.onclick = () => {
   void deviceAction(() => device.setScreenOff(false));
+};
+buttons.audio.onclick = () => {
+  if (audioPlayer.active) audioPlayer.mute();
+  else {
+    audioError = "";
+    void audioPlayer.enable().catch(audioFailure);
+  }
 };
 buttons.share.onclick = () => {
   void (async () => {
@@ -277,6 +338,7 @@ window.addEventListener(
     localInput.dispose();
     share.dispose();
     player.dispose();
+    audioPlayer.dispose();
     device.dispose();
   },
   { once: true },
